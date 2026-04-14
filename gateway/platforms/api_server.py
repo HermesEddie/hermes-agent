@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent as an available model
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
+- POST /api/tower/sales-target/agent-review — receive Tower sales-target review tasks and callback results
 - GET  /health                     — health check
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -24,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -208,6 +210,48 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _tower_error(message: str, code: str) -> Dict[str, Any]:
+    """Small helper for Tower integration error envelopes."""
+    return {
+        "error": {
+            "message": message,
+            "code": code,
+        }
+    }
+
+
+def _extract_json_from_text(raw_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort JSON extraction for model output.
+
+    Accepts:
+    - plain JSON object/array text
+    - fenced code blocks (```json ... ```)
+    - extra prose before/after the JSON payload
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, list):
+            return {"items": candidate}
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 if AIOHTTP_AVAILABLE:
@@ -401,6 +445,73 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    def _tower_internal_token(self) -> str:
+        """Shared token Hermes uses when calling Tower context/callback endpoints."""
+        return str(os.getenv("SALES_TARGET_AGENT_INTERNAL_TOKEN", "")).strip()
+
+    def _tower_internal_headers(self) -> Dict[str, str]:
+        token = self._tower_internal_token()
+        if not token:
+            return {"Content-Type": "application/json"}
+        return {
+            "Content-Type": "application/json",
+            "X-Sales-Target-Agent-Token": token,
+        }
+
+    def _tower_result_failure_item(self, node_key: str, message: str) -> Dict[str, Any]:
+        text = str(message or "Unknown failure").strip()[:1000] or "Unknown failure"
+        return {
+            "node_key": node_key,
+            "result_status": "failed",
+            "summary": text,
+            "note": text,
+            "missing_fields": [],
+            "evidence": [],
+            "recommended_action": "Inspect Hermes logs and retry the task.",
+        }
+
+    def _normalize_tower_result_item(self, raw_item: Dict[str, Any], *, node_key: str) -> Dict[str, Any]:
+        result_status = str(raw_item.get("result_status") or "completed").strip().lower() or "completed"
+        if result_status not in {"completed", "failed", "pending"}:
+            result_status = "completed"
+
+        judgment = str(raw_item.get("judgment") or "").strip().lower() or None
+        if judgment not in {None, "pass", "need_more_info", "invalid"}:
+            raise ValueError(f"Invalid judgment for node {node_key}: {judgment}")
+
+        score = raw_item.get("score")
+        if score is not None:
+            try:
+                score = round(float(score), 2)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid score for node {node_key}: {score}") from exc
+            if score < 1 or score > 5:
+                raise ValueError(f"Score must be between 1 and 5 for node {node_key}")
+
+        missing_fields = [
+            str(field).strip()
+            for field in (raw_item.get("missing_fields") or [])
+            if str(field).strip()
+        ]
+        evidence = []
+        for evidence_item in (raw_item.get("evidence") or []):
+            if isinstance(evidence_item, dict):
+                evidence.append(evidence_item)
+            elif evidence_item is not None:
+                evidence.append({"value": str(evidence_item)})
+
+        return {
+            "node_key": node_key,
+            "result_status": result_status,
+            "score": score,
+            "judgment": judgment,
+            "note": str(raw_item.get("note") or "").strip() or None,
+            "summary": str(raw_item.get("summary") or "").strip() or None,
+            "missing_fields": missing_fields,
+            "evidence": evidence,
+            "recommended_action": str(raw_item.get("recommended_action") or "").strip() or None,
+        }
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -1351,6 +1462,295 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return await loop.run_in_executor(None, _run)
 
+    async def _run_tower_sales_target_review(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        runtime_model: str,
+        prompt_version: str,
+        context_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Run a narrow no-tools review prompt for Tower sales-target tasks.
+
+        The model must return strict JSON with one result item per input node.
+        """
+        loop = asyncio.get_event_loop()
+
+        system_prompt = (
+            "You are Hermes reviewing Amazon sales target reasonableness for a BP management workflow.\n"
+            "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
+            "Output schema:\n"
+            "{\n"
+            '  "items": [\n'
+            "    {\n"
+            '      "node_key": "string",\n'
+            '      "score": 1.0,\n'
+            '      "judgment": "pass|need_more_info|invalid",\n'
+            '      "note": "short explanation",\n'
+            '      "summary": "one-line summary",\n'
+            '      "missing_fields": ["field"],\n'
+            '      "evidence": [{"label": "field", "value": "evidence"}],\n'
+            '      "recommended_action": "next step"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Rules:\n"
+            "- pass: the reason is specific and consistent with inventory/progress/history.\n"
+            "- need_more_info: the reason may be plausible but lacks critical support.\n"
+            "- invalid: the reason clearly conflicts with the supplied data.\n"
+            "- score must be between 1.0 and 5.0.\n"
+            "- include every input node_key exactly once.\n"
+            "- evidence must quote only from supplied fields.\n"
+            "- if evidence is weak, prefer need_more_info instead of pass.\n"
+        )
+
+        user_message = (
+            f"Task ID: {task_id}\n"
+            f"Request ID: {request_id}\n"
+            f"Model hint: {runtime_model}\n"
+            f"Prompt version: {prompt_version}\n\n"
+            "Review the following sales-target items and return JSON only:\n"
+            f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
+        )
+
+        def _run():
+            from run_agent import AIAgent
+            from gateway.run import _resolve_runtime_agent_kwargs, GatewayRunner
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            fallback_model = GatewayRunner._load_fallback_model()
+
+            agent = AIAgent(
+                model=runtime_model,
+                **runtime_kwargs,
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                ephemeral_system_prompt=system_prompt,
+                enabled_toolsets=[],
+                session_id=f"tower_{task_id}",
+                platform="api_server",
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=None,
+                persist_session=False,
+                fallback_model=fallback_model,
+            )
+            result = agent.run_conversation(
+                user_message=user_message,
+                conversation_history=[],
+            )
+            return result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+        raw_response = await loop.run_in_executor(None, _run)
+        parsed = _extract_json_from_text(raw_response)
+        if not parsed:
+            raise ValueError("Hermes review output was not valid JSON")
+
+        raw_items = parsed.get("items")
+        if not isinstance(raw_items, list):
+            raise ValueError("Hermes review JSON must contain an 'items' array")
+
+        by_node_key = {
+            str(item.get("node_key") or "").strip(): item
+            for item in raw_items
+            if str(item.get("node_key") or "").strip()
+        }
+
+        normalized: List[Dict[str, Any]] = []
+        for context_item in context_items:
+            node_key = str(context_item.get("node_key") or "").strip()
+            candidate = by_node_key.get(node_key)
+            if not candidate:
+                normalized.append(
+                    self._tower_result_failure_item(
+                        node_key,
+                        "Hermes output did not include this node_key.",
+                    )
+                )
+                continue
+            try:
+                normalized.append(self._normalize_tower_result_item(candidate, node_key=node_key))
+            except ValueError as exc:
+                normalized.append(self._tower_result_failure_item(node_key, str(exc)))
+
+        return normalized
+
+    async def _fetch_tower_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch batch review context from Tower using the shared internal token."""
+        if not self._tower_internal_token():
+            raise RuntimeError("SALES_TARGET_AGENT_INTERNAL_TOKEN is not configured")
+
+        context_url = str(payload.get("context_url") or "").strip()
+        if not context_url:
+            raise ValueError("Missing context_url")
+
+        body = {
+            "tenant_id": payload.get("tenant_id"),
+            "view_id": payload.get("view_id"),
+            "start_month": payload.get("start_month"),
+            "node_keys": payload.get("node_keys") or [],
+            "task_id": payload.get("task_id"),
+        }
+
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                context_url,
+                json=body,
+                headers=self._tower_internal_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"Tower context fetch failed ({response.status}): {text[:400]}")
+                return await response.json()
+
+    async def _post_tower_results(
+        self,
+        *,
+        callback_url: str,
+        tenant_id: str,
+        request_id: str,
+        model_name: str,
+        prompt_version: str,
+        items: List[Dict[str, Any]],
+    ) -> None:
+        """Callback Tower with normalized review results."""
+        if not self._tower_internal_token():
+            raise RuntimeError("SALES_TARGET_AGENT_INTERNAL_TOKEN is not configured")
+
+        import aiohttp
+
+        body = {
+            "tenant_id": tenant_id,
+            "hermes_request_id": request_id,
+            "model_name": model_name,
+            "prompt_version": prompt_version,
+            "items": items,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=body,
+                headers=self._tower_internal_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"Tower callback failed ({response.status}): {text[:400]}")
+
+    async def _run_tower_sales_target_review_job(self, payload: Dict[str, Any], request_id: str) -> None:
+        """Background job: fetch Tower context, run Hermes review, callback results."""
+        task_id = str(payload.get("task_id") or "").strip()
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        runtime_model = (
+            str(os.getenv("TOWER_AGENT_REVIEW_RUNTIME_MODEL") or "").strip()
+            or self._model_name
+        )
+        prompt_version = str(payload.get("prompt_version") or "v1").strip() or "v1"
+        callback_url = str(payload.get("callback_url") or "").strip()
+        node_keys = [str(node_key).strip() for node_key in (payload.get("node_keys") or []) if str(node_key).strip()]
+
+        failure_items = [
+            self._tower_result_failure_item(node_key, "Hermes task failed before completion.")
+            for node_key in node_keys
+        ]
+
+        try:
+            context_payload = await self._fetch_tower_context(payload)
+            context_items = context_payload.get("items") or []
+            if not isinstance(context_items, list) or not context_items:
+                raise RuntimeError("Tower context response did not contain review items")
+            normalized_items = await self._run_tower_sales_target_review(
+                request_id=request_id,
+                task_id=task_id,
+                runtime_model=runtime_model,
+                prompt_version=prompt_version,
+                context_items=context_items,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] tower sales-target review task %s failed before callback", task_id or request_id)
+            normalized_items = [
+                self._tower_result_failure_item(node_key, str(exc))
+                for node_key in node_keys
+            ] or failure_items
+
+        try:
+            if not callback_url:
+                raise RuntimeError("Missing callback_url")
+            await self._post_tower_results(
+                callback_url=callback_url,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                model_name=runtime_model,
+                prompt_version=prompt_version,
+                items=normalized_items,
+            )
+        except Exception:
+            logger.exception("[api_server] tower sales-target review callback failed for request %s", request_id)
+
+    async def _handle_tower_sales_target_review(self, request: "web.Request") -> "web.Response":
+        """POST /api/tower/sales-target/agent-review — accept Tower review task and process asynchronously."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
+
+        required_fields = [
+            "task_id",
+            "tenant_id",
+            "view_id",
+            "start_month",
+            "node_keys",
+            "context_url",
+            "callback_url",
+        ]
+        missing = [field for field in required_fields if not body.get(field)]
+        if missing:
+            return web.json_response(
+                _tower_error(f"Missing required fields: {', '.join(missing)}", "missing_fields"),
+                status=400,
+            )
+        if not self._tower_internal_token():
+            return web.json_response(
+                _tower_error("SALES_TARGET_AGENT_INTERNAL_TOKEN is not configured", "missing_internal_token"),
+                status=500,
+            )
+
+        if not isinstance(body.get("node_keys"), list) or not body.get("node_keys"):
+            return web.json_response(
+                _tower_error("'node_keys' must be a non-empty array", "invalid_node_keys"),
+                status=400,
+            )
+
+        request_id = f"tower_{uuid.uuid4().hex}"
+        job = asyncio.create_task(self._run_tower_sales_target_review_job(body, request_id))
+        try:
+            self._background_tasks.add(job)
+        except TypeError:
+            pass
+        if hasattr(job, "add_done_callback"):
+            job.add_done_callback(self._background_tasks.discard)
+
+        return web.json_response(
+            {
+                "request_id": request_id,
+                "task_id": str(body.get("task_id") or "").strip(),
+                "status": "accepted",
+            },
+            status=202,
+        )
+
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
@@ -1649,6 +2049,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/api/tower/sales-target/agent-review", self._handle_tower_sales_target_review)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
