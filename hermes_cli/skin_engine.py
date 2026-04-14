@@ -32,6 +32,8 @@ All fields are optional. Missing values inherit from the ``default`` skin.
       response_border: "#FFD700"         # Response box border (ANSI)
       session_label: "#DAA520"           # Session label color
       session_border: "#8B8682"          # Session ID dim color
+      menu_bg: "#1a1a2e"                 # Completion/autocomplete menu background
+      menu_bg_selected: "#333355"        # Selected item in completion menu
 
     # Spinner: customize the animated spinner during API calls
     spinner:
@@ -87,6 +89,7 @@ BUILT-IN SKINS
 - ``ares``    — Crimson/bronze war-god theme with custom spinner wings
 - ``mono``    — Clean grayscale monochrome
 - ``slate``   — Cool blue developer-focused theme
+- ``light``   — Dark text for white/light terminal backgrounds
 
 USER SKINS
 ==========
@@ -164,6 +167,8 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             "response_border": "#FFD700",
             "session_label": "#DAA520",
             "session_border": "#8B8682",
+            "menu_bg": "#1a1a2e",
+            "menu_bg_selected": "#333355",
         },
         "spinner": {
             # Empty = use hardcoded defaults in display.py
@@ -497,6 +502,39 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 [#F29C38]⠀⠀⠀⠀⠀⠀⠀⣼⡟⠀⠀⢻⣧⠀⠀⠀⠀⠀⠀⠀⠀[/]
 [dim #7A3511]⠀⠀⠀⠀⠀⠀⠀tail flame lit⠀⠀⠀⠀⠀⠀⠀⠀[/]""",
     },
+    "light": {
+        "name": "light",
+        "description": "Light terminal — dark text for white/light backgrounds",
+        "colors": {
+            "banner_border": "#8B6914",
+            "banner_title": "#6B4C00",
+            "banner_accent": "#7A5C00",
+            "banner_dim": "#999999",
+            "banner_text": "#1A1A1A",
+            "ui_accent": "#7A5C00",
+            "ui_label": "#0069A8",
+            "ui_ok": "#2E7D32",
+            "ui_error": "#C62828",
+            "ui_warn": "#D84315",
+            "prompt": "#1A1A1A",
+            "input_rule": "#8B6914",
+            "response_border": "#B8860B",
+            "session_label": "#6B4C00",
+            "session_border": "#999999",
+            "menu_bg": "#EDEDED",
+            "menu_bg_selected": "#D4D4D4",
+        },
+        "spinner": {},
+        "branding": {
+            "agent_name": "Hermes Agent",
+            "welcome": "Welcome to Hermes Agent! Type your message or /help for commands.",
+            "goodbye": "Goodbye! ⚕",
+            "response_label": " ⚕ Hermes ",
+            "prompt_symbol": "❯ ",
+            "help_header": "(^_^)? Available Commands",
+        },
+        "tool_prefix": "┊",
+    },
 }
 
 
@@ -685,6 +723,8 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
     label = skin.get_color("ui_label", title)
     warn = skin.get_color("ui_warn", "#FF8C00")
     error = skin.get_color("ui_error", "#FF6B6B")
+    menu_bg = skin.get_color("menu_bg", "#1a1a2e")
+    menu_bg_sel = skin.get_color("menu_bg_selected", "#333355")
 
     return {
         "input-area": prompt,
@@ -694,11 +734,11 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
         "hint": f"{dim} italic",
         "input-rule": input_rule,
         "image-badge": f"{label} bold",
-        "completion-menu": f"bg:#1a1a2e {text}",
-        "completion-menu.completion": f"bg:#1a1a2e {text}",
-        "completion-menu.completion.current": f"bg:#333355 {title}",
-        "completion-menu.meta.completion": f"bg:#1a1a2e {dim}",
-        "completion-menu.meta.completion.current": f"bg:#333355 {label}",
+        "completion-menu": f"bg:{menu_bg} {text}",
+        "completion-menu.completion": f"bg:{menu_bg} {text}",
+        "completion-menu.completion.current": f"bg:{menu_bg_sel} {title}",
+        "completion-menu.meta.completion": f"bg:{menu_bg} {dim}",
+        "completion-menu.meta.completion.current": f"bg:{menu_bg_sel} {label}",
         "clarify-border": input_rule,
         "clarify-title": f"{title} bold",
         "clarify-question": f"{text} bold",
