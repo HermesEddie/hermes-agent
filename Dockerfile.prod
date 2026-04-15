@@ -27,8 +27,6 @@ RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\n' >/etc/apt/apt.c
         ca-certificates \
         ffmpeg \
         git \
-        nodejs \
-        npm \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
@@ -54,6 +52,12 @@ ENTRYPOINT ["/opt/hermes/docker/entrypoint.sh"]
 CMD ["gateway", "run", "--replace"]
 
 FROM runtime-core AS runtime-browser
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json /opt/hermes/
 
