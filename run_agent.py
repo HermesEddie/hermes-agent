@@ -5356,7 +5356,12 @@ class AIAgent:
         if (getattr(self, "provider", "") or "").lower() in {"alibaba", "opencode-go"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base or "opencode.ai/zen/go" in base
+        return (
+            "dashscope" in base
+            or "aliyuncs" in base
+            or "opencode.ai/zen/go" in base
+            or "open.bigmodel.cn/api/anthropic" in base
+        )
 
     def _is_qwen_portal(self) -> bool:
         """Return True when the base URL targets Qwen Portal."""
