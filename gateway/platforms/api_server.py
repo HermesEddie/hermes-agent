@@ -516,6 +516,43 @@ class APIServerAdapter(BasePlatformAdapter):
             "recommended_action": "Inspect Hermes logs and retry the task.",
         }
 
+    @staticmethod
+    def _tower_expected_node_keys(context_items: List[Dict[str, Any]]) -> List[str]:
+        return [str(item.get("node_key") or "").strip() for item in context_items if str(item.get("node_key") or "").strip()]
+
+    @staticmethod
+    def _tower_result_integrity(
+        raw_items: List[Dict[str, Any]],
+        *,
+        expected_node_keys: List[str],
+    ) -> Dict[str, List[str]]:
+        expected_set = set(expected_node_keys)
+        seen: List[str] = []
+        duplicates: List[str] = []
+        unexpected: List[str] = []
+
+        for raw_item in raw_items:
+            node_key = str(raw_item.get("node_key") or "").strip()
+            if not node_key:
+                continue
+            if node_key in seen:
+                duplicates.append(node_key)
+                continue
+            seen.append(node_key)
+            if node_key not in expected_set:
+                unexpected.append(node_key)
+
+        missing = [node_key for node_key in expected_node_keys if node_key not in seen]
+        return {
+            "missing": missing,
+            "duplicates": duplicates,
+            "unexpected": unexpected,
+        }
+
+    @staticmethod
+    def _tower_integrity_has_issues(integrity: Dict[str, List[str]]) -> bool:
+        return any(bool(integrity.get(key)) for key in ("missing", "duplicates", "unexpected"))
+
     def _normalize_tower_result_item(self, raw_item: Dict[str, Any], *, node_key: str) -> Dict[str, Any]:
         result_status = str(raw_item.get("result_status") or "completed").strip().lower() or "completed"
         if result_status not in {"completed", "failed", "pending"}:
@@ -1522,6 +1559,7 @@ class APIServerAdapter(BasePlatformAdapter):
         The model must return strict JSON with one result item per input node.
         """
         loop = asyncio.get_event_loop()
+        expected_node_keys = self._tower_expected_node_keys(context_items)
 
         system_prompt = (
             "You are Hermes reviewing Amazon sales target reasonableness for a BP management workflow.\n"
@@ -1547,8 +1585,16 @@ class APIServerAdapter(BasePlatformAdapter):
             "- invalid: the reason clearly conflicts with the supplied data.\n"
             "- score must be between 1.0 and 5.0.\n"
             "- include every input node_key exactly once.\n"
+            "- never omit a node_key even if you are uncertain; use need_more_info for uncertainty.\n"
+            "- never merge two node_keys into one result item.\n"
+            "- never return fewer items than the number of input node_keys.\n"
             "- evidence must quote only from supplied fields.\n"
             "- if evidence is weak, prefer need_more_info instead of pass.\n"
+            "Few-shot examples (follow the policy, do not copy text):\n"
+            "1) promotion + short note like '活动中' + hero/main variant + high grade + active replenish_status + sufficient sellable/in_transit + no direct contradiction => pass, because action signal exists and supply/history can carry the target.\n"
+            "2) ads + explicit action signal + hero variant + inventory support => pass, even if the ad plan is not written as a detailed budget document.\n"
+            "3) issue_type=other but issue_note or previous-week note says '6月PD' or 'Prime Day' + hero/high-grade + sufficient stock => treat it as a real promotion signal and prefer pass unless there is direct contradiction.\n"
+            "4) promotion on a D-grade tail variant with very large uplift, weak support, and clear mismatch against supply/history => invalid.\n"
         )
 
         user_message = (
@@ -1556,11 +1602,12 @@ class APIServerAdapter(BasePlatformAdapter):
             f"Request ID: {request_id}\n"
             f"Model hint: {runtime_model}\n"
             f"Prompt version: {prompt_version}\n\n"
+            f"Required node_keys (must all appear exactly once): {json.dumps(expected_node_keys, ensure_ascii=False)}\n\n"
             "Review the following sales-target items and return JSON only:\n"
             f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
         )
 
-        def _run():
+        def _run(review_system_prompt: str, review_user_message: str):
             from run_agent import AIAgent
             from gateway.run import _resolve_runtime_agent_kwargs, GatewayRunner
 
@@ -1574,7 +1621,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 verbose_logging=False,
-                ephemeral_system_prompt=system_prompt,
+                ephemeral_system_prompt=review_system_prompt,
                 enabled_toolsets=[],
                 session_id=f"tower_{task_id}",
                 platform="api_server",
@@ -1585,12 +1632,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 fallback_model=fallback_model,
             )
             result = agent.run_conversation(
-                user_message=user_message,
+                user_message=review_user_message,
                 conversation_history=[],
             )
             return result.get("final_response", "") if isinstance(result, dict) else str(result)
 
-        raw_response = await loop.run_in_executor(None, _run)
+        async def _invoke(review_system_prompt: str, review_user_message: str) -> str:
+            return await loop.run_in_executor(None, _run, review_system_prompt, review_user_message)
+
+        raw_response = await _invoke(system_prompt, user_message)
         parsed = _extract_json_from_text(raw_response)
         if not parsed:
             raise ValueError("Hermes review output was not valid JSON")
@@ -1598,6 +1648,39 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_items = parsed.get("items")
         if not isinstance(raw_items, list):
             raise ValueError("Hermes review JSON must contain an 'items' array")
+
+        integrity = self._tower_result_integrity(raw_items, expected_node_keys=expected_node_keys)
+        if self._tower_integrity_has_issues(integrity):
+            repair_system_prompt = (
+                system_prompt
+                + "\nRepair mode:\n"
+                + "- You must repair the previous output into valid JSON.\n"
+                + "- Return one item for every required node_key, exactly once.\n"
+                + "- Do not omit any required node_key.\n"
+                + "- Do not include unexpected node_keys.\n"
+                + "- If one item is uncertain, still emit need_more_info for that node_key.\n"
+            )
+            repair_user_message = (
+                f"Task ID: {task_id}\n"
+                f"Request ID: {request_id}\n"
+                f"Model hint: {runtime_model}\n"
+                f"Prompt version: {prompt_version}\n\n"
+                f"Required node_keys: {json.dumps(expected_node_keys, ensure_ascii=False)}\n"
+                f"Missing node_keys: {json.dumps(integrity.get('missing') or [], ensure_ascii=False)}\n"
+                f"Duplicate node_keys: {json.dumps(integrity.get('duplicates') or [], ensure_ascii=False)}\n"
+                f"Unexpected node_keys: {json.dumps(integrity.get('unexpected') or [], ensure_ascii=False)}\n\n"
+                "Previous invalid/incomplete output:\n"
+                f"{raw_response}\n\n"
+                "Original review items:\n"
+                f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
+            )
+            repaired_response = await _invoke(repair_system_prompt, repair_user_message)
+            repaired = _extract_json_from_text(repaired_response)
+            if repaired and isinstance(repaired.get("items"), list):
+                repaired_items = repaired.get("items") or []
+                repaired_integrity = self._tower_result_integrity(repaired_items, expected_node_keys=expected_node_keys)
+                if not self._tower_integrity_has_issues(repaired_integrity):
+                    raw_items = repaired_items
 
         by_node_key = {
             str(item.get("node_key") or "").strip(): item

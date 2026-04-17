@@ -239,6 +239,87 @@ class TestTowerSalesTargetJob:
         assert captured["conversation_history"] == []
 
     @pytest.mark.asyncio
+    async def test_review_repairs_missing_node_keys(self):
+        adapter = _make_adapter()
+        captured: dict[str, int] = {"calls": 0}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, user_message, conversation_history):
+                captured["calls"] += 1
+                if captured["calls"] == 1:
+                    return {
+                        "final_response": json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "node_key": "asin-1",
+                                        "score": 4.2,
+                                        "judgment": "pass",
+                                        "note": "动作信号成立",
+                                        "summary": "可通过",
+                                        "missing_fields": [],
+                                        "evidence": [{"label": "issue_note", "value": "活动中"}],
+                                        "recommended_action": "继续观察",
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                return {
+                    "final_response": json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "node_key": "asin-1",
+                                    "score": 4.2,
+                                    "judgment": "pass",
+                                    "note": "动作信号成立",
+                                    "summary": "可通过",
+                                    "missing_fields": [],
+                                    "evidence": [{"label": "issue_note", "value": "活动中"}],
+                                    "recommended_action": "继续观察",
+                                },
+                                {
+                                    "node_key": "asin-2",
+                                    "score": 3.0,
+                                    "judgment": "need_more_info",
+                                    "note": "需要补充关键判断",
+                                    "summary": "关键判断被卡住",
+                                    "missing_fields": ["历史表现"],
+                                    "evidence": [{"label": "issue_type", "value": "promotion"}],
+                                    "recommended_action": "补充历史表现后重评",
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+
+        with patch("run_agent.AIAgent", FakeAgent), patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"provider": "nous", "api_key": "k", "base_url": "https://example.com", "api_mode": "chat_completions", "command": None, "args": [], "credential_pool": None},
+        ), patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None):
+            result = await adapter._run_tower_sales_target_review(
+                request_id="req-1",
+                task_id="task-1",
+                runtime_model="z-ai/glm-5.1",
+                prompt_version="sales_target_default_pass_v4",
+                context_items=[
+                    {"node_key": "asin-1", "issue_note": "活动中"},
+                    {"node_key": "asin-2", "issue_type": "promotion"},
+                ],
+            )
+
+        assert captured["calls"] == 2
+        assert [item["node_key"] for item in result] == ["asin-1", "asin-2"]
+        assert result[0]["judgment"] == "pass"
+        assert result[1]["judgment"] == "need_more_info"
+
+    @pytest.mark.asyncio
     async def test_job_callbacks_failed_items_when_review_raises(self):
         adapter = _make_adapter()
         payload = {
