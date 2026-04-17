@@ -459,6 +459,51 @@ class APIServerAdapter(BasePlatformAdapter):
             "X-Sales-Target-Agent-Token": token,
         }
 
+    def _resolve_tower_review_runtime_model(
+        self,
+        payload: Dict[str, Any],
+        *,
+        runtime_provider: str | None,
+    ) -> str:
+        """Choose the effective model for Tower sales-target review tasks.
+
+        Priority:
+        1. ``payload.model_name`` from Tower
+        2. ``TOWER_AGENT_REVIEW_RUNTIME_MODEL`` from Hermes env
+        3. API server advertised fallback model name
+
+        When the runtime provider is known, normalize the selected model into
+        the provider-specific API format so aggregator-style models like
+        ``glm-5.1`` become ``z-ai/glm-5.1`` for Nous/OpenRouter runtimes.
+        """
+        requested_model = str(payload.get("model_name") or "").strip()
+        configured_model = (
+            str(os.getenv("TOWER_AGENT_REVIEW_RUNTIME_MODEL") or "").strip()
+            or self._model_name
+        )
+        selected_model = requested_model or configured_model
+        if not selected_model:
+            return selected_model
+
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            from hermes_cli.providers import normalize_provider
+
+            normalized_provider = normalize_provider(str(runtime_provider or "").strip())
+            if normalized_provider:
+                normalized_model = normalize_model_for_provider(selected_model, normalized_provider).strip()
+                if normalized_model:
+                    return normalized_model
+        except Exception:
+            logger.debug(
+                "[api_server] tower sales-target review model normalization failed for provider=%s model=%s",
+                runtime_provider,
+                selected_model,
+                exc_info=True,
+            )
+
+        return selected_model
+
     def _tower_result_failure_item(self, node_key: str, message: str) -> Dict[str, Any]:
         text = str(message or "Unknown failure").strip()[:1000] or "Unknown failure"
         return {
@@ -1649,9 +1694,12 @@ class APIServerAdapter(BasePlatformAdapter):
         """Background job: fetch Tower context, run Hermes review, callback results."""
         task_id = str(payload.get("task_id") or "").strip()
         tenant_id = str(payload.get("tenant_id") or "").strip()
-        runtime_model = (
-            str(os.getenv("TOWER_AGENT_REVIEW_RUNTIME_MODEL") or "").strip()
-            or self._model_name
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = self._resolve_tower_review_runtime_model(
+            payload,
+            runtime_provider=str(runtime_kwargs.get("provider") or "").strip() or None,
         )
         prompt_version = str(payload.get("prompt_version") or "v1").strip() or "v1"
         callback_url = str(payload.get("callback_url") or "").strip()

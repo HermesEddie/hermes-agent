@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -138,6 +139,104 @@ class TestTowerSalesTargetJob:
         callback_items = callback_mock.await_args.kwargs["items"]
         assert callback_items[0]["judgment"] == "pass"
         assert callback_items[0]["node_key"] == "asin-1"
+
+    @pytest.mark.asyncio
+    async def test_job_prefers_payload_model_name_and_normalizes_for_provider(self, monkeypatch):
+        adapter = _make_adapter()
+        payload = {
+            "task_id": "task-1",
+            "tenant_id": "tenant-1",
+            "view_id": "view-1",
+            "start_month": "2026-04",
+            "node_keys": ["asin-1"],
+            "context_url": "http://tower/context",
+            "callback_url": "http://tower/callback",
+            "prompt_version": "v1",
+            "model_name": "glm-5.1",
+        }
+
+        fetch_mock = AsyncMock(return_value={"items": [{"node_key": "asin-1", "issue_note": "活动中"}]})
+        run_mock = AsyncMock(
+            return_value=[
+                {
+                    "node_key": "asin-1",
+                    "result_status": "completed",
+                    "score": 4.6,
+                    "judgment": "pass",
+                    "note": "动作信号成立",
+                    "summary": "可通过",
+                    "missing_fields": [],
+                    "evidence": [{"label": "issue_note", "value": "活动中"}],
+                    "recommended_action": "继续观察",
+                }
+            ]
+        )
+        callback_mock = AsyncMock()
+
+        monkeypatch.setenv("TOWER_AGENT_REVIEW_RUNTIME_MODEL", "glm-5-turbo")
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "nous"}), patch.object(
+            adapter, "_fetch_tower_context", fetch_mock
+        ), patch.object(adapter, "_run_tower_sales_target_review", run_mock), patch.object(
+            adapter, "_post_tower_results", callback_mock
+        ):
+            await adapter._run_tower_sales_target_review_job(payload, "req-override")
+
+        assert run_mock.await_args.kwargs["runtime_model"] == "z-ai/glm-5.1"
+        assert callback_mock.await_args.kwargs["model_name"] == "z-ai/glm-5.1"
+
+    @pytest.mark.asyncio
+    async def test_review_path_uses_no_tools_and_skips_context_files(self):
+        adapter = _make_adapter()
+        captured: dict[str, object] = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                captured["agent_kwargs"] = kwargs
+
+            def run_conversation(self, user_message, conversation_history):
+                captured["user_message"] = user_message
+                captured["conversation_history"] = conversation_history
+                return {
+                    "final_response": json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "node_key": "asin-1",
+                                    "score": 4.2,
+                                    "judgment": "pass",
+                                    "note": "动作信号成立",
+                                    "summary": "可通过",
+                                    "missing_fields": [],
+                                    "evidence": [{"label": "issue_note", "value": "活动中"}],
+                                    "recommended_action": "继续观察",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+
+        with patch("run_agent.AIAgent", FakeAgent), patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"provider": "nous", "api_key": "k", "base_url": "https://example.com", "api_mode": "chat_completions", "command": None, "args": [], "credential_pool": None},
+        ), patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None):
+            result = await adapter._run_tower_sales_target_review(
+                request_id="req-1",
+                task_id="task-1",
+                runtime_model="z-ai/glm-5.1",
+                prompt_version="sales_target_default_pass_v4",
+                context_items=[{"node_key": "asin-1", "issue_note": "活动中"}],
+            )
+
+        assert result[0]["judgment"] == "pass"
+        agent_kwargs = captured["agent_kwargs"]
+        assert agent_kwargs["enabled_toolsets"] == []
+        assert agent_kwargs["skip_context_files"] is True
+        assert agent_kwargs["skip_memory"] is True
+        assert agent_kwargs["persist_session"] is False
+        assert "sales_target_default_pass_v4" in captured["user_message"]
+        assert captured["conversation_history"] == []
 
     @pytest.mark.asyncio
     async def test_job_callbacks_failed_items_when_review_raises(self):
