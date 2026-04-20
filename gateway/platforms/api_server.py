@@ -448,7 +448,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _tower_internal_token(self) -> str:
         """Shared token Hermes uses when calling Tower context/callback endpoints."""
-        return str(os.getenv("SALES_TARGET_AGENT_INTERNAL_TOKEN", "")).strip()
+        return str(
+            os.getenv("AGENT_WORKSPACE_INTERNAL_TOKEN")
+            or os.getenv("SALES_TARGET_AGENT_INTERNAL_TOKEN", "")
+        ).strip()
 
     def _tower_internal_headers(self) -> Dict[str, str]:
         token = self._tower_internal_token()
@@ -456,6 +459,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return {"Content-Type": "application/json"}
         return {
             "Content-Type": "application/json",
+            "X-Agent-Workspace-Token": token,
             "X-Sales-Target-Agent-Token": token,
         }
 
@@ -1710,7 +1714,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _fetch_tower_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch batch review context from Tower using the shared internal token."""
         if not self._tower_internal_token():
-            raise RuntimeError("SALES_TARGET_AGENT_INTERNAL_TOKEN is not configured")
+            raise RuntimeError("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured")
 
         context_url = str(payload.get("context_url") or "").strip()
         if not context_url:
@@ -1750,7 +1754,7 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> None:
         """Callback Tower with normalized review results."""
         if not self._tower_internal_token():
-            raise RuntimeError("SALES_TARGET_AGENT_INTERNAL_TOKEN is not configured")
+            raise RuntimeError("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured")
 
         import aiohttp
 
@@ -1854,7 +1858,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         if not self._tower_internal_token():
             return web.json_response(
-                _tower_error("SALES_TARGET_AGENT_INTERNAL_TOKEN is not configured", "missing_internal_token"),
+                _tower_error("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured", "missing_internal_token"),
                 status=500,
             )
 

@@ -32,6 +32,17 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
 
 
 class TestTowerSalesTargetRoute:
+    def test_internal_token_prefers_agent_workspace_env(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("SALES_TARGET_AGENT_INTERNAL_TOKEN", "old-token")
+        monkeypatch.setenv("AGENT_WORKSPACE_INTERNAL_TOKEN", "new-token")
+
+        headers = adapter._tower_internal_headers()
+
+        assert adapter._tower_internal_token() == "new-token"
+        assert headers["X-Agent-Workspace-Token"] == "new-token"
+        assert headers["X-Sales-Target-Agent-Token"] == "new-token"
+
     @pytest.mark.asyncio
     async def test_requires_auth_when_api_key_configured(self):
         adapter = _make_adapter(api_key="secret")

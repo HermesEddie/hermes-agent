@@ -809,7 +809,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 display:
   tool_progress: all      # off | new | all | verbose
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
-  tool_progress_overrides: {}  # Per-platform overrides (see below)
+  tool_progress_overrides: {feishu: off}  # Per-platform overrides (see below)
   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
   personality: "kawaii"  # Legacy cosmetic field still surfaced in some summaries
   compact: false          # Compact output mode (less whitespace)
@@ -841,6 +841,7 @@ display:
     signal: 'off'             # silence progress on Signal
     telegram: verbose         # detailed progress on Telegram
     slack: 'off'              # quiet in shared Slack workspace
+    feishu: 'off'             # keep Feishu replies focused on final answers
 ```
 
 Platforms without an override fall back to the global `tool_progress` value. Valid platform keys: `telegram`, `discord`, `slack`, `signal`, `whatsapp`, `matrix`, `mattermost`, `email`, `sms`, `homeassistant`, `dingtalk`, `feishu`, `wecom`, `bluebubbles`.

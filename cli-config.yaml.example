@@ -762,6 +762,8 @@ display:
   #   verbose: Full args, results, and debug logs (same as /verbose)
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
+  tool_progress_overrides:
+    feishu: off
 
   # What Enter does when Hermes is already busy in the CLI.
   #   interrupt: Interrupt the current run and redirect Hermes (default)
@@ -776,7 +778,7 @@ display:
   #   result:  Only the final completion message
   #   error:   Only the final message when exit code != 0
   #   all:     Running output updates + final message (default)
-  background_process_notifications: all
+  background_process_notifications: off
 
 
   # Play terminal bell when agent finishes a response.
