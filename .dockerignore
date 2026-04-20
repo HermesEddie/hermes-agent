@@ -5,8 +5,6 @@
 
 # Dependencies
 node_modules
-website/node_modules
-venv
 .venv
 
 # CI/CD
@@ -14,14 +12,5 @@ venv
 
 # Environment files
 .env
-.omx
-.pytest_cache
-__pycache__
-*.pyc
-dist
-build
-tests
-website
-.DS_Store
 
 *.md

@@ -255,6 +255,11 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
+        # Graceful drain timeout for gateway stop/restart (seconds).
+        # The gateway stops accepting new work, waits for running agents
+        # to finish, then interrupts any remaining runs after the timeout.
+        # 0 = no drain, interrupt immediately.
+        "restart_drain_timeout": 60,
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -1600,6 +1605,55 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
         lines.append(f"  {marker} {ci.message}")
     lines.append("  \033[2mRun 'hermes doctor' for fix suggestions.\033[0m")
     sys.stderr.write("\n".join(lines) + "\n\n")
+
+
+def get_compatible_custom_providers(
+    config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Return a deduplicated custom-provider view across legacy and keyed config."""
+    if config is None:
+        config = load_config()
+
+    compatible: List[Dict[str, Any]] = []
+    seen_provider_keys: set[str] = set()
+    seen_name_url_pairs: set[tuple[str, str, str]] = set()
+
+    def _append_if_new(entry: Optional[Dict[str, Any]]) -> None:
+        if entry is None:
+            return
+        provider_key = str(entry.get("provider_key", "") or "").strip().lower()
+        name = str(entry.get("name", "") or "").strip().lower()
+        base_url = str(entry.get("base_url", "") or "").strip().rstrip("/").lower()
+        model = str(entry.get("model", "") or "").strip().lower()
+        pair = (name, base_url, model)
+
+        if provider_key and provider_key in seen_provider_keys:
+            return
+        if name and base_url and pair in seen_name_url_pairs:
+            return
+
+        compatible.append(entry)
+        if provider_key:
+            seen_provider_keys.add(provider_key)
+        if name and base_url:
+            seen_name_url_pairs.add(pair)
+
+    legacy = config.get("custom_providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            if isinstance(entry, dict):
+                _append_if_new(entry)
+
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for provider_key, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            merged = dict(entry)
+            merged.setdefault("provider_key", str(provider_key))
+            _append_if_new(merged)
+
+    return compatible
 
 
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:

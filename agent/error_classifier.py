@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import enum
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -82,16 +81,6 @@ class ClassifiedError:
     def is_auth(self) -> bool:
         return self.reason in (FailoverReason.auth, FailoverReason.auth_permanent)
 
-    @property
-    def is_transient(self) -> bool:
-        """Error is expected to resolve on retry (with or without backoff)."""
-        return self.reason in (
-            FailoverReason.rate_limit,
-            FailoverReason.overloaded,
-            FailoverReason.server_error,
-            FailoverReason.timeout,
-            FailoverReason.unknown,
-        )
 
 
 # ── Provider-specific patterns ──────────────────────────────────────────
@@ -122,6 +111,7 @@ _RATE_LIMIT_PATTERNS = [
     "try again in",
     "please retry after",
     "resource_exhausted",
+    "rate increased too quickly",  # Alibaba/DashScope throttling
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -166,6 +156,18 @@ _CONTEXT_OVERFLOW_PATTERNS = [
     "prompt exceeds max length",
     "max_tokens",
     "maximum number of tokens",
+    # vLLM / local inference server patterns
+    "exceeds the max_model_len",
+    "max_model_len",
+    "prompt length",             # "engine prompt length X exceeds"
+    "input is too long",
+    "maximum model length",
+    # Ollama patterns
+    "context length exceeded",
+    "truncating input",
+    # llama.cpp / llama-server patterns
+    "slot context",              # "slot context: N tokens, prompt N tokens"
+    "n_ctx_slot",
     # Chinese error messages (some providers return these)
     "超过最大长度",
     "上下文长度",
@@ -725,11 +727,16 @@ def _classify_by_message(
         )
 
     # Auth patterns
+    # Auth errors should NOT be retried directly — the credential is invalid and
+    # retrying with the same key will always fail.  Set retryable=False so the
+    # caller triggers credential rotation (should_rotate_credential=True) or
+    # provider fallback rather than an immediate retry loop.
     if any(p in error_msg for p in _AUTH_PATTERNS):
         return result_fn(
             FailoverReason.auth,
-            retryable=True,
+            retryable=False,
             should_rotate_credential=True,
+            should_fallback=True,
         )
 
     # Model not found patterns
