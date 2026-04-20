@@ -224,6 +224,8 @@ Control how much tool activity is displayed in `~/.hermes/config.yaml`:
 ```yaml
 display:
   tool_progress: all    # off | new | all | verbose
+  tool_progress_overrides:
+    feishu: off
   tool_progress_command: false  # set to true to enable /verbose in messaging
 ```
 
@@ -266,15 +268,15 @@ When the agent running a background session uses `terminal(background=true)` to 
 
 ```yaml
 display:
-  background_process_notifications: all    # all | result | error | off
+  background_process_notifications: off    # all | result | error | off
 ```
 
 | Mode | What you receive |
 |------|-----------------|
-| `all` | Running-output updates **and** the final completion message (default) |
+| `all` | Running-output updates **and** the final completion message |
 | `result` | Only the final completion message (regardless of exit code) |
 | `error` | Only the final message when the exit code is non-zero |
-| `off` | No process watcher messages at all |
+| `off` | No process watcher messages at all (default) |
 
 You can also set this via environment variable:
 

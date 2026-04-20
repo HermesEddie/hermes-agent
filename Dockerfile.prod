@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+
+FROM --platform=$TARGETPLATFORM python:3.11-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HERMES_HOME=/opt/data \
+    PYTHONPATH=/opt/hermes \
+    PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /opt/hermes
+
+# Production build: prefer IPv4 + HTTPS mirrors + retries to reduce flaky
+# Debian package fetches in cloud regions.
+RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\n' >/etc/apt/apt.conf.d/99force-ipv4 \
+    && if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        git \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM base AS py-deps
+
+COPY requirements-prod-api-server.txt /tmp/requirements.txt
+
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+
+FROM base AS runtime-core
+
+COPY --from=py-deps /opt/venv /opt/venv
+COPY . /opt/hermes
+
+RUN chmod +x /opt/hermes/docker/entrypoint.sh \
+    && printf '%s\n' '#!/usr/bin/env bash' 'exec python -m hermes_cli.main "$@"' > /usr/local/bin/hermes \
+    && chmod +x /usr/local/bin/hermes
+
+VOLUME ["/opt/data"]
+ENTRYPOINT ["/opt/hermes/docker/entrypoint.sh"]
+CMD ["gateway", "run", "--replace"]
+
+FROM runtime-core AS runtime-browser
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json /opt/hermes/
+
+RUN npm ci --omit=dev \
+    && npx playwright install --with-deps chromium --only-shell \
+    && npm cache clean --force

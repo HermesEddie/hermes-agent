@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent as an available model
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
+- POST /api/tower/sales-target/agent-review — receive Tower sales-target review tasks and callback results
 - GET  /health                     — health check
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -20,12 +21,10 @@ Requires:
 """
 
 import asyncio
-import hashlib
 import hmac
 import json
 import logging
 import os
-import socket as _socket
 import re
 import sqlite3
 import time
@@ -43,7 +42,6 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
-    is_network_accessible,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,67 +51,6 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
-CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
-MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
-MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
-
-
-def _normalize_chat_content(
-    content: Any, *, _max_depth: int = 10, _depth: int = 0,
-) -> str:
-    """Normalize OpenAI chat message content into a plain text string.
-
-    Some clients (Open WebUI, LobeChat, etc.) send content as an array of
-    typed parts instead of a plain string::
-
-        [{"type": "text", "text": "hello"}, {"type": "input_text", "text": "..."}]
-
-    This function flattens those into a single string so the agent pipeline
-    (which expects strings) doesn't choke.
-
-    Defensive limits prevent abuse: recursion depth, list size, and output
-    length are all bounded.
-    """
-    if _depth > _max_depth:
-        return ""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
-        for item in items:
-            if isinstance(item, str):
-                if item:
-                    parts.append(item[:MAX_NORMALIZED_TEXT_LENGTH])
-            elif isinstance(item, dict):
-                item_type = str(item.get("type") or "").strip().lower()
-                if item_type in {"text", "input_text", "output_text"}:
-                    text = item.get("text", "")
-                    if text:
-                        try:
-                            parts.append(str(text)[:MAX_NORMALIZED_TEXT_LENGTH])
-                        except Exception:
-                            pass
-                # Silently skip image_url / other non-text parts
-            elif isinstance(item, list):
-                nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
-                if nested:
-                    parts.append(nested)
-            # Check accumulated size
-            if sum(len(p) for p in parts) >= MAX_NORMALIZED_TEXT_LENGTH:
-                break
-        result = "\n".join(parts)
-        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
-
-    # Fallback for unexpected types (int, float, bool, etc.)
-    try:
-        result = str(content)
-        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
-    except Exception:
-        return ""
 
 
 def check_api_server_requirements() -> bool:
@@ -275,6 +212,48 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _tower_error(message: str, code: str) -> Dict[str, Any]:
+    """Small helper for Tower integration error envelopes."""
+    return {
+        "error": {
+            "message": message,
+            "code": code,
+        }
+    }
+
+
+def _extract_json_from_text(raw_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort JSON extraction for model output.
+
+    Accepts:
+    - plain JSON object/array text
+    - fenced code blocks (```json ... ```)
+    - extra prose before/after the JSON payload
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, list):
+            return {"items": candidate}
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -345,24 +324,6 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
     return sha256(repr(subset).encode("utf-8")).hexdigest()
-
-
-def _derive_chat_session_id(
-    system_prompt: Optional[str],
-    first_user_message: str,
-) -> str:
-    """Derive a stable session ID from the conversation's first user message.
-
-    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
-    conversation history with every request.  The system prompt and first user
-    message are constant across all turns of the same conversation, so hashing
-    them produces a deterministic session ID that lets the API server reuse
-    the same Hermes session (and therefore the same Docker container sandbox
-    directory) across turns.
-    """
-    seed = f"{system_prompt or ''}\n{first_user_message}"
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
-    return f"api-{digest}"
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -469,8 +430,7 @@ class APIServerAdapter(BasePlatformAdapter):
         Validate Bearer token from Authorization header.
 
         Returns None if auth is OK, or a 401 web.Response on failure.
-        If no API key is configured, all requests are allowed (only when API
-        server is local).
+        If no API key is configured, all requests are allowed.
         """
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
@@ -485,6 +445,159 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    def _tower_internal_token(self) -> str:
+        """Shared token Hermes uses when calling Tower context/callback endpoints."""
+        return str(
+            os.getenv("AGENT_WORKSPACE_INTERNAL_TOKEN")
+            or os.getenv("SALES_TARGET_AGENT_INTERNAL_TOKEN", "")
+        ).strip()
+
+    def _tower_internal_headers(self) -> Dict[str, str]:
+        token = self._tower_internal_token()
+        if not token:
+            return {"Content-Type": "application/json"}
+        return {
+            "Content-Type": "application/json",
+            "X-Agent-Workspace-Token": token,
+            "X-Sales-Target-Agent-Token": token,
+        }
+
+    def _resolve_tower_review_runtime_model(
+        self,
+        payload: Dict[str, Any],
+        *,
+        runtime_provider: str | None,
+    ) -> str:
+        """Choose the effective model for Tower sales-target review tasks.
+
+        Priority:
+        1. ``payload.model_name`` from Tower
+        2. ``TOWER_AGENT_REVIEW_RUNTIME_MODEL`` from Hermes env
+        3. API server advertised fallback model name
+
+        When the runtime provider is known, normalize the selected model into
+        the provider-specific API format so aggregator-style models like
+        ``glm-5.1`` become ``z-ai/glm-5.1`` for Nous/OpenRouter runtimes.
+        """
+        requested_model = str(payload.get("model_name") or "").strip()
+        configured_model = (
+            str(os.getenv("TOWER_AGENT_REVIEW_RUNTIME_MODEL") or "").strip()
+            or self._model_name
+        )
+        selected_model = requested_model or configured_model
+        if not selected_model:
+            return selected_model
+
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            from hermes_cli.providers import normalize_provider
+
+            normalized_provider = normalize_provider(str(runtime_provider or "").strip())
+            if normalized_provider:
+                normalized_model = normalize_model_for_provider(selected_model, normalized_provider).strip()
+                if normalized_model:
+                    return normalized_model
+        except Exception:
+            logger.debug(
+                "[api_server] tower sales-target review model normalization failed for provider=%s model=%s",
+                runtime_provider,
+                selected_model,
+                exc_info=True,
+            )
+
+        return selected_model
+
+    def _tower_result_failure_item(self, node_key: str, message: str) -> Dict[str, Any]:
+        text = str(message or "Unknown failure").strip()[:1000] or "Unknown failure"
+        return {
+            "node_key": node_key,
+            "result_status": "failed",
+            "summary": text,
+            "note": text,
+            "missing_fields": [],
+            "evidence": [],
+            "recommended_action": "Inspect Hermes logs and retry the task.",
+        }
+
+    @staticmethod
+    def _tower_expected_node_keys(context_items: List[Dict[str, Any]]) -> List[str]:
+        return [str(item.get("node_key") or "").strip() for item in context_items if str(item.get("node_key") or "").strip()]
+
+    @staticmethod
+    def _tower_result_integrity(
+        raw_items: List[Dict[str, Any]],
+        *,
+        expected_node_keys: List[str],
+    ) -> Dict[str, List[str]]:
+        expected_set = set(expected_node_keys)
+        seen: List[str] = []
+        duplicates: List[str] = []
+        unexpected: List[str] = []
+
+        for raw_item in raw_items:
+            node_key = str(raw_item.get("node_key") or "").strip()
+            if not node_key:
+                continue
+            if node_key in seen:
+                duplicates.append(node_key)
+                continue
+            seen.append(node_key)
+            if node_key not in expected_set:
+                unexpected.append(node_key)
+
+        missing = [node_key for node_key in expected_node_keys if node_key not in seen]
+        return {
+            "missing": missing,
+            "duplicates": duplicates,
+            "unexpected": unexpected,
+        }
+
+    @staticmethod
+    def _tower_integrity_has_issues(integrity: Dict[str, List[str]]) -> bool:
+        return any(bool(integrity.get(key)) for key in ("missing", "duplicates", "unexpected"))
+
+    def _normalize_tower_result_item(self, raw_item: Dict[str, Any], *, node_key: str) -> Dict[str, Any]:
+        result_status = str(raw_item.get("result_status") or "completed").strip().lower() or "completed"
+        if result_status not in {"completed", "failed", "pending"}:
+            result_status = "completed"
+
+        judgment = str(raw_item.get("judgment") or "").strip().lower() or None
+        if judgment not in {None, "pass", "need_more_info", "invalid"}:
+            raise ValueError(f"Invalid judgment for node {node_key}: {judgment}")
+
+        score = raw_item.get("score")
+        if score is not None:
+            try:
+                score = round(float(score), 2)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid score for node {node_key}: {score}") from exc
+            if score < 1 or score > 5:
+                raise ValueError(f"Score must be between 1 and 5 for node {node_key}")
+
+        missing_fields = [
+            str(field).strip()
+            for field in (raw_item.get("missing_fields") or [])
+            if str(field).strip()
+        ]
+        evidence = []
+        for evidence_item in (raw_item.get("evidence") or []):
+            if isinstance(evidence_item, dict):
+                evidence.append(evidence_item)
+            elif evidence_item is not None:
+                evidence.append({"value": str(evidence_item)})
+
+        return {
+            "node_key": node_key,
+            "result_status": result_status,
+            "score": score,
+            "judgment": judgment,
+            "note": str(raw_item.get("note") or "").strip() or None,
+            "summary": str(raw_item.get("summary") or "").strip() or None,
+            "missing_fields": missing_fields,
+            "evidence": evidence,
+            "recommended_action": str(raw_item.get("recommended_action") or "").strip() or None,
+        }
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -613,7 +726,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         for msg in messages:
             role = msg.get("role", "")
-            content = _normalize_chat_content(msg.get("content", ""))
+            content = msg.get("content", "")
             if role == "system":
                 # Accumulate system messages
                 if system_prompt is None:
@@ -638,32 +751,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
-        #
-        # Security: session continuation exposes conversation history, so it is
-        # only allowed when the API key is configured and the request is
-        # authenticated.  Without this gate, any unauthenticated client could
-        # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
-            if not self._api_key:
-                logger.warning(
-                    "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity."
-                )
-                return web.json_response(
-                    _openai_error(
-                        "Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature."
-                    ),
-                    status=403,
-                )
-            # Sanitize: reject control characters that could enable header injection.
-            if re.search(r'[\r\n\x00]', provided_session_id):
-                return web.json_response(
-                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
-                    status=400,
-                )
             session_id = provided_session_id
             try:
                 db = self._ensure_session_db()
@@ -673,16 +762,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            # Derive a stable session ID from the conversation fingerprint so
-            # that consecutive messages from the same Open WebUI (or similar)
-            # conversation map to the same Hermes session.  The first user
-            # message + system prompt are constant across all turns.
-            first_user = ""
-            for cm in conversation_messages:
-                if cm.get("role") == "user":
-                    first_user = cm.get("content", "")
-                    break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = str(uuid.uuid4())
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -705,35 +785,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Send tool progress as a separate SSE event.
-
-                Previously, progress markers like ``⏰ list`` were injected
-                directly into ``delta.content``.  OpenAI-compatible frontends
-                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
-                the assistant message and send it back on subsequent requests.
-                After enough turns the model learns to *emit* the markers as
-                plain text instead of issuing real tool calls — silently
-                hallucinating tool results.  See #6972.
-
-                The fix: push a tagged tuple ``("__tool_progress__", payload)``
-                onto the stream queue.  The SSE writer emits it as a custom
-                ``event: hermes.tool.progress`` line that compliant frontends
-                can render for UX but will *not* persist into conversation
-                history.  Clients that don't understand the custom event type
-                silently ignore it per the SSE specification.
-                """
+                """Inject tool progress into the SSE stream for Open WebUI."""
                 if event_type != "tool.started":
-                    return
+                    return  # Only show tool start events in chat stream
                 if name.startswith("_"):
-                    return
+                    return  # Skip internal events (_thinking)
                 from agent.display import get_tool_emoji
                 emoji = get_tool_emoji(name)
                 label = preview or name
-                _stream_q.put(("__tool_progress__", {
-                    "tool": name,
-                    "emoji": emoji,
-                    "label": label,
-                }))
+                _stream_q.put(f"\n`{emoji} {label}`\n")
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -823,11 +883,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         import queue as _q
 
-        sse_headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
         # CORS middleware can't inject headers into StreamResponse after
         # prepare() flushes them, so resolve CORS headers up front.
         origin = request.headers.get("Origin", "")
@@ -840,8 +896,6 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
-            last_activity = time.monotonic()
-
             # Role chunk
             role_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -849,31 +903,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
-            last_activity = time.monotonic()
-
-            # Helper — route a queue item to the correct SSE event.
-            async def _emit(item):
-                """Write a single queue item to the SSE stream.
-
-                Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972.
-                """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
-                    await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
-                    )
-                else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
-                return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
@@ -888,19 +917,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
-                                last_activity = await _emit(delta)
+                                content_chunk = {
+                                    "id": completion_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                                }
+                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                             except _q.Empty:
                                 break
                         break
-                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
-                        await response.write(b": keepalive\n\n")
-                        last_activity = time.monotonic()
                     continue
 
                 if delta is None:  # End of stream sentinel
                     break
 
-                last_activity = await _emit(delta)
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -986,7 +1022,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = _normalize_chat_content(item.get("content", ""))
+                    content = item.get("content", "")
+                    # Handle content that may be a list of content parts
+                    if isinstance(content, list):
+                        text_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "input_text":
+                                text_parts.append(part.get("text", ""))
+                            elif isinstance(part, dict) and part.get("type") == "output_text":
+                                text_parts.append(part.get("text", ""))
+                            elif isinstance(part, str):
+                                text_parts.append(part)
+                        content = "\n".join(text_parts)
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -1491,7 +1538,6 @@ class APIServerAdapter(BasePlatformAdapter):
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                task_id="default",
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1501,6 +1547,344 @@ class APIServerAdapter(BasePlatformAdapter):
             return result, usage
 
         return await loop.run_in_executor(None, _run)
+
+    async def _run_tower_sales_target_review(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        runtime_model: str,
+        prompt_version: str,
+        context_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Run a narrow no-tools review prompt for Tower sales-target tasks.
+
+        The model must return strict JSON with one result item per input node.
+        """
+        loop = asyncio.get_event_loop()
+        expected_node_keys = self._tower_expected_node_keys(context_items)
+
+        system_prompt = (
+            "You are Hermes reviewing Amazon sales target reasonableness for a BP management workflow.\n"
+            "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
+            "Output schema:\n"
+            "{\n"
+            '  "items": [\n'
+            "    {\n"
+            '      "node_key": "string",\n'
+            '      "score": 1.0,\n'
+            '      "judgment": "pass|need_more_info|invalid",\n'
+            '      "note": "short explanation",\n'
+            '      "summary": "one-line summary",\n'
+            '      "missing_fields": ["field"],\n'
+            '      "evidence": [{"label": "field", "value": "evidence"}],\n'
+            '      "recommended_action": "next step"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Rules:\n"
+            "- pass: the reason is specific and consistent with inventory/progress/history.\n"
+            "- need_more_info: the reason may be plausible but lacks critical support.\n"
+            "- invalid: the reason clearly conflicts with the supplied data.\n"
+            "- score must be between 1.0 and 5.0.\n"
+            "- include every input node_key exactly once.\n"
+            "- never omit a node_key even if you are uncertain; use need_more_info for uncertainty.\n"
+            "- never merge two node_keys into one result item.\n"
+            "- never return fewer items than the number of input node_keys.\n"
+            "- evidence must quote only from supplied fields.\n"
+            "- if evidence is weak, prefer need_more_info instead of pass.\n"
+            "Few-shot examples (follow the policy, do not copy text):\n"
+            "1) promotion + short note like '活动中' + hero/main variant + high grade + active replenish_status + sufficient sellable/in_transit + no direct contradiction => pass, because action signal exists and supply/history can carry the target.\n"
+            "2) ads + explicit action signal + hero variant + inventory support => pass, even if the ad plan is not written as a detailed budget document.\n"
+            "3) issue_type=other but issue_note or previous-week note says '6月PD' or 'Prime Day' + hero/high-grade + sufficient stock => treat it as a real promotion signal and prefer pass unless there is direct contradiction.\n"
+            "4) promotion on a D-grade tail variant with very large uplift, weak support, and clear mismatch against supply/history => invalid.\n"
+        )
+
+        user_message = (
+            f"Task ID: {task_id}\n"
+            f"Request ID: {request_id}\n"
+            f"Model hint: {runtime_model}\n"
+            f"Prompt version: {prompt_version}\n\n"
+            f"Required node_keys (must all appear exactly once): {json.dumps(expected_node_keys, ensure_ascii=False)}\n\n"
+            "Review the following sales-target items and return JSON only:\n"
+            f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
+        )
+
+        def _run(review_system_prompt: str, review_user_message: str):
+            from run_agent import AIAgent
+            from gateway.run import _resolve_runtime_agent_kwargs, GatewayRunner
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            fallback_model = GatewayRunner._load_fallback_model()
+
+            agent = AIAgent(
+                model=runtime_model,
+                **runtime_kwargs,
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                ephemeral_system_prompt=review_system_prompt,
+                enabled_toolsets=[],
+                session_id=f"tower_{task_id}",
+                platform="api_server",
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=None,
+                persist_session=False,
+                fallback_model=fallback_model,
+            )
+            result = agent.run_conversation(
+                user_message=review_user_message,
+                conversation_history=[],
+            )
+            return result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+        async def _invoke(review_system_prompt: str, review_user_message: str) -> str:
+            return await loop.run_in_executor(None, _run, review_system_prompt, review_user_message)
+
+        raw_response = await _invoke(system_prompt, user_message)
+        parsed = _extract_json_from_text(raw_response)
+        if not parsed:
+            raise ValueError("Hermes review output was not valid JSON")
+
+        raw_items = parsed.get("items")
+        if not isinstance(raw_items, list):
+            raise ValueError("Hermes review JSON must contain an 'items' array")
+
+        integrity = self._tower_result_integrity(raw_items, expected_node_keys=expected_node_keys)
+        if self._tower_integrity_has_issues(integrity):
+            repair_system_prompt = (
+                system_prompt
+                + "\nRepair mode:\n"
+                + "- You must repair the previous output into valid JSON.\n"
+                + "- Return one item for every required node_key, exactly once.\n"
+                + "- Do not omit any required node_key.\n"
+                + "- Do not include unexpected node_keys.\n"
+                + "- If one item is uncertain, still emit need_more_info for that node_key.\n"
+            )
+            repair_user_message = (
+                f"Task ID: {task_id}\n"
+                f"Request ID: {request_id}\n"
+                f"Model hint: {runtime_model}\n"
+                f"Prompt version: {prompt_version}\n\n"
+                f"Required node_keys: {json.dumps(expected_node_keys, ensure_ascii=False)}\n"
+                f"Missing node_keys: {json.dumps(integrity.get('missing') or [], ensure_ascii=False)}\n"
+                f"Duplicate node_keys: {json.dumps(integrity.get('duplicates') or [], ensure_ascii=False)}\n"
+                f"Unexpected node_keys: {json.dumps(integrity.get('unexpected') or [], ensure_ascii=False)}\n\n"
+                "Previous invalid/incomplete output:\n"
+                f"{raw_response}\n\n"
+                "Original review items:\n"
+                f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
+            )
+            repaired_response = await _invoke(repair_system_prompt, repair_user_message)
+            repaired = _extract_json_from_text(repaired_response)
+            if repaired and isinstance(repaired.get("items"), list):
+                repaired_items = repaired.get("items") or []
+                repaired_integrity = self._tower_result_integrity(repaired_items, expected_node_keys=expected_node_keys)
+                if not self._tower_integrity_has_issues(repaired_integrity):
+                    raw_items = repaired_items
+
+        by_node_key = {
+            str(item.get("node_key") or "").strip(): item
+            for item in raw_items
+            if str(item.get("node_key") or "").strip()
+        }
+
+        normalized: List[Dict[str, Any]] = []
+        for context_item in context_items:
+            node_key = str(context_item.get("node_key") or "").strip()
+            candidate = by_node_key.get(node_key)
+            if not candidate:
+                normalized.append(
+                    self._tower_result_failure_item(
+                        node_key,
+                        "Hermes output did not include this node_key.",
+                    )
+                )
+                continue
+            try:
+                normalized.append(self._normalize_tower_result_item(candidate, node_key=node_key))
+            except ValueError as exc:
+                normalized.append(self._tower_result_failure_item(node_key, str(exc)))
+
+        return normalized
+
+    async def _fetch_tower_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch batch review context from Tower using the shared internal token."""
+        if not self._tower_internal_token():
+            raise RuntimeError("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured")
+
+        context_url = str(payload.get("context_url") or "").strip()
+        if not context_url:
+            raise ValueError("Missing context_url")
+
+        body = {
+            "tenant_id": payload.get("tenant_id"),
+            "view_id": payload.get("view_id"),
+            "start_month": payload.get("start_month"),
+            "node_keys": payload.get("node_keys") or [],
+            "task_id": payload.get("task_id"),
+        }
+
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                context_url,
+                json=body,
+                headers=self._tower_internal_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"Tower context fetch failed ({response.status}): {text[:400]}")
+                return await response.json()
+
+    async def _post_tower_results(
+        self,
+        *,
+        callback_url: str,
+        tenant_id: str,
+        request_id: str,
+        model_name: str,
+        prompt_version: str,
+        items: List[Dict[str, Any]],
+    ) -> None:
+        """Callback Tower with normalized review results."""
+        if not self._tower_internal_token():
+            raise RuntimeError("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured")
+
+        import aiohttp
+
+        body = {
+            "tenant_id": tenant_id,
+            "hermes_request_id": request_id,
+            "model_name": model_name,
+            "prompt_version": prompt_version,
+            "items": items,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=body,
+                headers=self._tower_internal_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"Tower callback failed ({response.status}): {text[:400]}")
+
+    async def _run_tower_sales_target_review_job(self, payload: Dict[str, Any], request_id: str) -> None:
+        """Background job: fetch Tower context, run Hermes review, callback results."""
+        task_id = str(payload.get("task_id") or "").strip()
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = self._resolve_tower_review_runtime_model(
+            payload,
+            runtime_provider=str(runtime_kwargs.get("provider") or "").strip() or None,
+        )
+        prompt_version = str(payload.get("prompt_version") or "v1").strip() or "v1"
+        callback_url = str(payload.get("callback_url") or "").strip()
+        node_keys = [str(node_key).strip() for node_key in (payload.get("node_keys") or []) if str(node_key).strip()]
+
+        failure_items = [
+            self._tower_result_failure_item(node_key, "Hermes task failed before completion.")
+            for node_key in node_keys
+        ]
+
+        try:
+            context_payload = await self._fetch_tower_context(payload)
+            context_items = context_payload.get("items") or []
+            if not isinstance(context_items, list) or not context_items:
+                raise RuntimeError("Tower context response did not contain review items")
+            normalized_items = await self._run_tower_sales_target_review(
+                request_id=request_id,
+                task_id=task_id,
+                runtime_model=runtime_model,
+                prompt_version=prompt_version,
+                context_items=context_items,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] tower sales-target review task %s failed before callback", task_id or request_id)
+            normalized_items = [
+                self._tower_result_failure_item(node_key, str(exc))
+                for node_key in node_keys
+            ] or failure_items
+
+        try:
+            if not callback_url:
+                raise RuntimeError("Missing callback_url")
+            await self._post_tower_results(
+                callback_url=callback_url,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                model_name=runtime_model,
+                prompt_version=prompt_version,
+                items=normalized_items,
+            )
+        except Exception:
+            logger.exception("[api_server] tower sales-target review callback failed for request %s", request_id)
+
+    async def _handle_tower_sales_target_review(self, request: "web.Request") -> "web.Response":
+        """POST /api/tower/sales-target/agent-review — accept Tower review task and process asynchronously."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
+
+        required_fields = [
+            "task_id",
+            "tenant_id",
+            "view_id",
+            "start_month",
+            "node_keys",
+            "context_url",
+            "callback_url",
+        ]
+        missing = [field for field in required_fields if not body.get(field)]
+        if missing:
+            return web.json_response(
+                _tower_error(f"Missing required fields: {', '.join(missing)}", "missing_fields"),
+                status=400,
+            )
+        if not self._tower_internal_token():
+            return web.json_response(
+                _tower_error("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured", "missing_internal_token"),
+                status=500,
+            )
+
+        if not isinstance(body.get("node_keys"), list) or not body.get("node_keys"):
+            return web.json_response(
+                _tower_error("'node_keys' must be a non-empty array", "invalid_node_keys"),
+                status=400,
+            )
+
+        request_id = f"tower_{uuid.uuid4().hex}"
+        job = asyncio.create_task(self._run_tower_sales_target_review_job(body, request_id))
+        try:
+            self._background_tasks.add(job)
+        except TypeError:
+            pass
+        if hasattr(job, "add_done_callback"):
+            job.add_done_callback(self._background_tasks.discard)
+
+        return web.json_response(
+            {
+                "request_id": request_id,
+                "task_id": str(body.get("task_id") or "").strip(),
+                "status": "accepted",
+            },
+            status=202,
+        )
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -1658,7 +2042,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     r = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
-                        task_id="default",
                     )
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1801,6 +2184,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/api/tower/sales-target/agent-review", self._handle_tower_sales_target_review)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -1810,33 +2194,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
-            # Refuse to start network-accessible without authentication
-            if is_network_accessible(self._host) and not self._api_key:
-                logger.error(
-                    "[%s] Refusing to start: binding to %s requires API_SERVER_KEY. "
-                    "Set API_SERVER_KEY or use the default 127.0.0.1.",
-                    self.name, self._host,
-                )
-                return False
-
-            # Refuse to start network-accessible with a placeholder key.
-            # Ported from openclaw/openclaw#64586.
-            if is_network_accessible(self._host) and self._api_key:
-                try:
-                    from hermes_cli.auth import has_usable_secret
-                    if not has_usable_secret(self._api_key, min_length=8):
-                        logger.error(
-                            "[%s] Refusing to start: API_SERVER_KEY is set to a "
-                            "placeholder value. Generate a real secret "
-                            "(e.g. `openssl rand -hex 32`) and set API_SERVER_KEY "
-                            "before exposing the API server on %s.",
-                            self.name, self._host,
-                        )
-                        return False
-                except ImportError:
-                    pass
-
             # Port conflict detection — fail fast if port is already in use
+            import socket as _socket
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
@@ -1852,14 +2211,6 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._site.start()
 
             self._mark_connected()
-            if not self._api_key:
-                logger.warning(
-                    "[%s] ⚠️  No API key configured (API_SERVER_KEY / platforms.api_server.key). "
-                    "All requests will be accepted without authentication. "
-                    "Set an API key for production deployments to prevent "
-                    "unauthorized access to sessions, responses, and cron jobs.",
-                    self.name,
-                )
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,

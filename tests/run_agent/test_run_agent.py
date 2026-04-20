@@ -465,6 +465,26 @@ class TestInit:
             assert agent.api_mode == "anthropic_messages"
             mock_anthropic.Anthropic.assert_called_once()
 
+    def test_bigmodel_anthropic_endpoint_preserves_dots(self):
+        """BigModel's Anthropic-compatible endpoint expects GLM-5.1, not GLM-5-1."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter._anthropic_sdk"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                model="GLM-5.1",
+                provider="custom",
+                base_url="https://open.bigmodel.cn/api/anthropic",
+                api_mode="anthropic_messages",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert agent.api_mode == "anthropic_messages"
+            assert agent._anthropic_preserve_dots() is True
+
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (

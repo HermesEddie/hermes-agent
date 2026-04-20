@@ -1256,14 +1256,14 @@ class GatewayRunner:
                         mode = str(raw)
             except Exception:
                 pass
-        mode = (mode or "all").strip().lower()
+        mode = (mode or "off").strip().lower()
         valid = {"all", "result", "error", "off"}
         if mode not in valid:
             logger.warning(
-                "Unknown background_process_notifications '%s', defaulting to 'all'",
+                "Unknown background_process_notifications '%s', defaulting to 'off'",
                 mode,
             )
-            return "all"
+            return "off"
         return mode
 
     @staticmethod
