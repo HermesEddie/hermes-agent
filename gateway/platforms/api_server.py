@@ -557,6 +557,26 @@ class APIServerAdapter(BasePlatformAdapter):
     def _tower_integrity_has_issues(integrity: Dict[str, List[str]]) -> bool:
         return any(bool(integrity.get(key)) for key in ("missing", "duplicates", "unexpected"))
 
+    @staticmethod
+    def _tower_review_chunk_size() -> int:
+        raw = (
+            os.getenv("TOWER_AGENT_REVIEW_CHUNK_SIZE")
+            or os.getenv("TOWER_SALES_TARGET_REVIEW_CHUNK_SIZE")
+            or "1"
+        )
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = 1
+        return max(1, min(value, 10))
+
+    def _tower_context_item_chunks(self, context_items: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        chunk_size = self._tower_review_chunk_size()
+        return [
+            context_items[index:index + chunk_size]
+            for index in range(0, len(context_items), chunk_size)
+        ] or [[]]
+
     def _normalize_tower_result_item(self, raw_item: Dict[str, Any], *, node_key: str) -> Dict[str, Any]:
         result_status = str(raw_item.get("result_status") or "completed").strip().lower() or "completed"
         if result_status not in {"completed", "failed", "pending"}:
@@ -586,6 +606,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 evidence.append(evidence_item)
             elif evidence_item is not None:
                 evidence.append({"value": str(evidence_item)})
+        review_reason_codes = [
+            str(code).strip()
+            for code in (raw_item.get("review_reason_codes") or [])
+            if str(code).strip()
+        ]
 
         return {
             "node_key": node_key,
@@ -594,6 +619,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "judgment": judgment,
             "note": str(raw_item.get("note") or "").strip() or None,
             "summary": str(raw_item.get("summary") or "").strip() or None,
+            "transfer_impact_level": str(raw_item.get("transfer_impact_level") or "").strip() or None,
+            "reasonability_level": str(raw_item.get("reasonability_level") or "").strip() or None,
+            "review_reason_codes": review_reason_codes,
             "missing_fields": missing_fields,
             "evidence": evidence,
             "recommended_action": str(raw_item.get("recommended_action") or "").strip() or None,
@@ -1556,6 +1584,7 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime_model: str,
         prompt_version: str,
         context_items: List[Dict[str, Any]],
+        review_guidance: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         """
         Run a narrow no-tools review prompt for Tower sales-target tasks.
@@ -1564,10 +1593,19 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         loop = asyncio.get_event_loop()
         expected_node_keys = self._tower_expected_node_keys(context_items)
+        guidance = review_guidance if isinstance(review_guidance, dict) else {}
+        guidance_prompt = str(guidance.get("prompt_text") or "").strip()
+        guidance_payload = {
+            key: value
+            for key, value in guidance.items()
+            if key not in {"prompt_text"} and value not in (None, "", [], {})
+        }
 
         system_prompt = (
             "You are Hermes reviewing Amazon sales target reasonableness for a BP management workflow.\n"
             "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
+            "The Tower review policy below is authoritative. Apply it before the fallback schema rules.\n"
+            f"{guidance_prompt}\n\n"
             "Output schema:\n"
             "{\n"
             '  "items": [\n'
@@ -1577,6 +1615,9 @@ class APIServerAdapter(BasePlatformAdapter):
             '      "judgment": "pass|need_more_info|invalid",\n'
             '      "note": "short explanation",\n'
             '      "summary": "one-line summary",\n'
+            '      "transfer_impact_level": "low|medium|high",\n'
+            '      "reasonability_level": "plausible|borderline|contradictory",\n'
+            '      "review_reason_codes": ["code"],\n'
             '      "missing_fields": ["field"],\n'
             '      "evidence": [{"label": "field", "value": "evidence"}],\n'
             '      "recommended_action": "next step"\n'
@@ -1593,22 +1634,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "- never merge two node_keys into one result item.\n"
             "- never return fewer items than the number of input node_keys.\n"
             "- evidence must quote only from supplied fields.\n"
-            "- if evidence is weak, prefer need_more_info instead of pass.\n"
+            "- if Tower policy conflicts with fallback rules, Tower policy wins.\n"
             "Few-shot examples (follow the policy, do not copy text):\n"
             "1) promotion + short note like '活动中' + hero/main variant + high grade + active replenish_status + sufficient sellable/in_transit + no direct contradiction => pass, because action signal exists and supply/history can carry the target.\n"
             "2) ads + explicit action signal + hero variant + inventory support => pass, even if the ad plan is not written as a detailed budget document.\n"
             "3) issue_type=other but issue_note or previous-week note says '6月PD' or 'Prime Day' + hero/high-grade + sufficient stock => treat it as a real promotion signal and prefer pass unless there is direct contradiction.\n"
             "4) promotion on a D-grade tail variant with very large uplift, weak support, and clear mismatch against supply/history => invalid.\n"
-        )
-
-        user_message = (
-            f"Task ID: {task_id}\n"
-            f"Request ID: {request_id}\n"
-            f"Model hint: {runtime_model}\n"
-            f"Prompt version: {prompt_version}\n\n"
-            f"Required node_keys (must all appear exactly once): {json.dumps(expected_node_keys, ensure_ascii=False)}\n\n"
-            "Review the following sales-target items and return JSON only:\n"
-            f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
         )
 
         def _run(review_system_prompt: str, review_user_message: str):
@@ -1644,72 +1675,126 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _invoke(review_system_prompt: str, review_user_message: str) -> str:
             return await loop.run_in_executor(None, _run, review_system_prompt, review_user_message)
 
-        raw_response = await _invoke(system_prompt, user_message)
-        parsed = _extract_json_from_text(raw_response)
-        if not parsed:
-            raise ValueError("Hermes review output was not valid JSON")
-
-        raw_items = parsed.get("items")
-        if not isinstance(raw_items, list):
-            raise ValueError("Hermes review JSON must contain an 'items' array")
-
-        integrity = self._tower_result_integrity(raw_items, expected_node_keys=expected_node_keys)
-        if self._tower_integrity_has_issues(integrity):
-            repair_system_prompt = (
-                system_prompt
-                + "\nRepair mode:\n"
-                + "- You must repair the previous output into valid JSON.\n"
-                + "- Return one item for every required node_key, exactly once.\n"
-                + "- Do not omit any required node_key.\n"
-                + "- Do not include unexpected node_keys.\n"
-                + "- If one item is uncertain, still emit need_more_info for that node_key.\n"
-            )
-            repair_user_message = (
+        def _build_user_message(
+            *,
+            chunk_items: List[Dict[str, Any]],
+            chunk_node_keys: List[str],
+            chunk_index: int,
+            chunk_count: int,
+        ) -> str:
+            return (
                 f"Task ID: {task_id}\n"
                 f"Request ID: {request_id}\n"
                 f"Model hint: {runtime_model}\n"
-                f"Prompt version: {prompt_version}\n\n"
-                f"Required node_keys: {json.dumps(expected_node_keys, ensure_ascii=False)}\n"
-                f"Missing node_keys: {json.dumps(integrity.get('missing') or [], ensure_ascii=False)}\n"
-                f"Duplicate node_keys: {json.dumps(integrity.get('duplicates') or [], ensure_ascii=False)}\n"
-                f"Unexpected node_keys: {json.dumps(integrity.get('unexpected') or [], ensure_ascii=False)}\n\n"
-                "Previous invalid/incomplete output:\n"
-                f"{raw_response}\n\n"
-                "Original review items:\n"
-                f"{json.dumps(context_items, ensure_ascii=False, indent=2)}"
+                f"Prompt version: {prompt_version}\n"
+                f"Chunk: {chunk_index}/{chunk_count}\n\n"
+                "Tower review guidance metadata:\n"
+                f"{json.dumps(guidance_payload, ensure_ascii=False, indent=2)}\n\n"
+                f"Required node_keys (must all appear exactly once): {json.dumps(chunk_node_keys, ensure_ascii=False)}\n\n"
+                "Review the following sales-target items and return JSON only:\n"
+                f"{json.dumps(chunk_items, ensure_ascii=False, indent=2)}"
             )
-            repaired_response = await _invoke(repair_system_prompt, repair_user_message)
-            repaired = _extract_json_from_text(repaired_response)
-            if repaired and isinstance(repaired.get("items"), list):
-                repaired_items = repaired.get("items") or []
-                repaired_integrity = self._tower_result_integrity(repaired_items, expected_node_keys=expected_node_keys)
-                if not self._tower_integrity_has_issues(repaired_integrity):
-                    raw_items = repaired_items
 
-        by_node_key = {
-            str(item.get("node_key") or "").strip(): item
-            for item in raw_items
-            if str(item.get("node_key") or "").strip()
-        }
-
-        normalized: List[Dict[str, Any]] = []
-        for context_item in context_items:
-            node_key = str(context_item.get("node_key") or "").strip()
-            candidate = by_node_key.get(node_key)
-            if not candidate:
-                normalized.append(
-                    self._tower_result_failure_item(
-                        node_key,
-                        "Hermes output did not include this node_key.",
-                    )
-                )
-                continue
+        async def _review_chunk(
+            *,
+            chunk_items: List[Dict[str, Any]],
+            chunk_index: int,
+            chunk_count: int,
+        ) -> List[Dict[str, Any]]:
+            chunk_node_keys = self._tower_expected_node_keys(chunk_items)
+            user_message = _build_user_message(
+                chunk_items=chunk_items,
+                chunk_node_keys=chunk_node_keys,
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
+            )
             try:
-                normalized.append(self._normalize_tower_result_item(candidate, node_key=node_key))
-            except ValueError as exc:
-                normalized.append(self._tower_result_failure_item(node_key, str(exc)))
+                raw_response = await _invoke(system_prompt, user_message)
+                parsed = _extract_json_from_text(raw_response)
+                if not parsed:
+                    raise ValueError("Hermes review output was not valid JSON")
 
-        return normalized
+                raw_items = parsed.get("items")
+                if not isinstance(raw_items, list):
+                    raise ValueError("Hermes review JSON must contain an 'items' array")
+
+                integrity = self._tower_result_integrity(raw_items, expected_node_keys=chunk_node_keys)
+                if self._tower_integrity_has_issues(integrity):
+                    repair_system_prompt = (
+                        system_prompt
+                        + "\nRepair mode:\n"
+                        + "- You must repair the previous output into valid JSON.\n"
+                        + "- Return one item for every required node_key, exactly once.\n"
+                        + "- Do not omit any required node_key.\n"
+                        + "- Do not include unexpected node_keys.\n"
+                        + "- If one item is uncertain, still emit need_more_info for that node_key.\n"
+                    )
+                    repair_user_message = (
+                        f"Task ID: {task_id}\n"
+                        f"Request ID: {request_id}\n"
+                        f"Model hint: {runtime_model}\n"
+                        f"Prompt version: {prompt_version}\n"
+                        f"Chunk: {chunk_index}/{chunk_count}\n\n"
+                        f"Required node_keys: {json.dumps(chunk_node_keys, ensure_ascii=False)}\n"
+                        f"Missing node_keys: {json.dumps(integrity.get('missing') or [], ensure_ascii=False)}\n"
+                        f"Duplicate node_keys: {json.dumps(integrity.get('duplicates') or [], ensure_ascii=False)}\n"
+                        f"Unexpected node_keys: {json.dumps(integrity.get('unexpected') or [], ensure_ascii=False)}\n\n"
+                        "Previous invalid/incomplete output:\n"
+                        f"{raw_response}\n\n"
+                        "Original review items:\n"
+                        f"{json.dumps(chunk_items, ensure_ascii=False, indent=2)}"
+                    )
+                    repaired_response = await _invoke(repair_system_prompt, repair_user_message)
+                    repaired = _extract_json_from_text(repaired_response)
+                    if repaired and isinstance(repaired.get("items"), list):
+                        repaired_items = repaired.get("items") or []
+                        repaired_integrity = self._tower_result_integrity(repaired_items, expected_node_keys=chunk_node_keys)
+                        if not self._tower_integrity_has_issues(repaired_integrity):
+                            raw_items = repaired_items
+
+                by_node_key = {
+                    str(item.get("node_key") or "").strip(): item
+                    for item in raw_items
+                    if str(item.get("node_key") or "").strip()
+                }
+            except Exception as exc:
+                return [
+                    self._tower_result_failure_item(
+                        str(context_item.get("node_key") or "").strip(),
+                        str(exc),
+                    )
+                    for context_item in chunk_items
+                ]
+
+            normalized: List[Dict[str, Any]] = []
+            for context_item in chunk_items:
+                node_key = str(context_item.get("node_key") or "").strip()
+                candidate = by_node_key.get(node_key)
+                if not candidate:
+                    normalized.append(
+                        self._tower_result_failure_item(
+                            node_key,
+                            "Hermes output did not include this node_key.",
+                        )
+                    )
+                    continue
+                try:
+                    normalized.append(self._normalize_tower_result_item(candidate, node_key=node_key))
+                except ValueError as exc:
+                    normalized.append(self._tower_result_failure_item(node_key, str(exc)))
+            return normalized
+
+        chunks = self._tower_context_item_chunks(context_items)
+        normalized_results: List[Dict[str, Any]] = []
+        for index, chunk_items in enumerate(chunks, start=1):
+            normalized_results.extend(
+                await _review_chunk(
+                    chunk_items=chunk_items,
+                    chunk_index=index,
+                    chunk_count=len(chunks),
+                )
+            )
+        return normalized_results
 
     async def _fetch_tower_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch batch review context from Tower using the shared internal token."""
@@ -1800,6 +1885,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             context_payload = await self._fetch_tower_context(payload)
             context_items = context_payload.get("items") or []
+            review_guidance = context_payload.get("review_guidance") if isinstance(context_payload, dict) else None
             if not isinstance(context_items, list) or not context_items:
                 raise RuntimeError("Tower context response did not contain review items")
             normalized_items = await self._run_tower_sales_target_review(
@@ -1808,6 +1894,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_model=runtime_model,
                 prompt_version=prompt_version,
                 context_items=context_items,
+                review_guidance=review_guidance if isinstance(review_guidance, dict) else None,
             )
         except Exception as exc:
             logger.exception("[api_server] tower sales-target review task %s failed before callback", task_id or request_id)

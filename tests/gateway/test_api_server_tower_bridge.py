@@ -121,7 +121,15 @@ class TestTowerSalesTargetJob:
             "prompt_version": "v1",
         }
 
-        fetch_mock = AsyncMock(return_value={"items": [{"node_key": "asin-1", "issue_note": "活动"}]})
+        fetch_mock = AsyncMock(
+            return_value={
+                "review_guidance": {
+                    "prompt_text": "Tower policy: inventory_control with actual sales support should pass.",
+                    "prompt_version": "sales_target_default_pass_v8",
+                },
+                "items": [{"node_key": "asin-1", "issue_note": "活动"}],
+            }
+        )
         run_mock = AsyncMock(
             return_value=[
                 {
@@ -150,6 +158,7 @@ class TestTowerSalesTargetJob:
         callback_items = callback_mock.await_args.kwargs["items"]
         assert callback_items[0]["judgment"] == "pass"
         assert callback_items[0]["node_key"] == "asin-1"
+        assert run_mock.await_args.kwargs["review_guidance"]["prompt_version"] == "sales_target_default_pass_v8"
 
     @pytest.mark.asyncio
     async def test_job_prefers_payload_model_name_and_normalizes_for_provider(self, monkeypatch):
@@ -218,6 +227,9 @@ class TestTowerSalesTargetJob:
                                     "judgment": "pass",
                                     "note": "动作信号成立",
                                     "summary": "可通过",
+                                    "transfer_impact_level": "low",
+                                    "reasonability_level": "plausible",
+                                    "review_reason_codes": ["actual_sales_supported"],
                                     "missing_fields": [],
                                     "evidence": [{"label": "issue_note", "value": "活动中"}],
                                     "recommended_action": "继续观察",
@@ -238,6 +250,10 @@ class TestTowerSalesTargetJob:
                 runtime_model="z-ai/glm-5.1",
                 prompt_version="sales_target_default_pass_v4",
                 context_items=[{"node_key": "asin-1", "issue_note": "活动中"}],
+                review_guidance={
+                    "prompt_text": "Tower policy says short action notes can pass.",
+                    "prompt_version": "sales_target_default_pass_v8",
+                },
             )
 
         assert result[0]["judgment"] == "pass"
@@ -246,7 +262,13 @@ class TestTowerSalesTargetJob:
         assert agent_kwargs["skip_context_files"] is True
         assert agent_kwargs["skip_memory"] is True
         assert agent_kwargs["persist_session"] is False
+        assert "Tower policy says short action notes can pass." in agent_kwargs["ephemeral_system_prompt"]
+        assert "review_reason_codes" in agent_kwargs["ephemeral_system_prompt"]
+        assert result[0]["transfer_impact_level"] == "low"
+        assert result[0]["reasonability_level"] == "plausible"
+        assert result[0]["review_reason_codes"] == ["actual_sales_supported"]
         assert "sales_target_default_pass_v4" in captured["user_message"]
+        assert "sales_target_default_pass_v8" in captured["user_message"]
         assert captured["conversation_history"] == []
 
     @pytest.mark.asyncio
@@ -325,7 +347,7 @@ class TestTowerSalesTargetJob:
                 ],
             )
 
-        assert captured["calls"] == 2
+        assert captured["calls"] == 3
         assert [item["node_key"] for item in result] == ["asin-1", "asin-2"]
         assert result[0]["judgment"] == "pass"
         assert result[1]["judgment"] == "need_more_info"
