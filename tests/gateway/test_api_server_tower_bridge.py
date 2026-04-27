@@ -28,6 +28,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/api/tower/sales-target/agent-review", adapter._handle_tower_sales_target_review)
+    app.router.add_post(
+        "/api/tower/sales-target/progress-reminder/summary-guidance",
+        adapter._handle_tower_progress_summary_guidance,
+    )
     return app
 
 
@@ -264,6 +268,9 @@ class TestTowerSalesTargetJob:
         assert agent_kwargs["persist_session"] is False
         assert "Tower policy says short action notes can pass." in agent_kwargs["ephemeral_system_prompt"]
         assert "review_reason_codes" in agent_kwargs["ephemeral_system_prompt"]
+        assert "Few-shot examples" not in agent_kwargs["ephemeral_system_prompt"]
+        assert "fallback schema rules" not in agent_kwargs["ephemeral_system_prompt"]
+        assert "need_more_info" not in agent_kwargs["ephemeral_system_prompt"]
         assert result[0]["transfer_impact_level"] == "low"
         assert result[0]["reasonability_level"] == "plausible"
         assert result[0]["review_reason_codes"] == ["actual_sales_supported"]
@@ -345,12 +352,83 @@ class TestTowerSalesTargetJob:
                     {"node_key": "asin-1", "issue_note": "活动中"},
                     {"node_key": "asin-2", "issue_type": "promotion"},
                 ],
+                review_guidance={"prompt_text": "Tower review prompt."},
             )
 
         assert captured["calls"] == 3
         assert [item["node_key"] for item in result] == ["asin-1", "asin-2"]
         assert result[0]["judgment"] == "pass"
-        assert result[1]["judgment"] == "need_more_info"
+        assert result[1]["judgment"] == "manual_review"
+
+    def test_normalizes_legacy_tower_judgments_to_current_enum(self):
+        adapter = _make_adapter()
+
+        manual = adapter._normalize_tower_result_item(
+            {"judgment": "need_more_info"},
+            node_key="asin-1",
+        )
+        rejected = adapter._normalize_tower_result_item(
+            {"judgment": "invalid"},
+            node_key="asin-2",
+        )
+
+        assert manual["judgment"] == "manual_review"
+        assert rejected["judgment"] == "reject"
+
+    @pytest.mark.asyncio
+    async def test_summary_guidance_route_uses_tower_prompt(self):
+        adapter = _make_adapter(api_key="secret")
+        app = _create_app(adapter)
+        captured: dict[str, object] = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                captured["agent_kwargs"] = kwargs
+
+            def run_conversation(self, user_message, conversation_history):
+                captured["user_message"] = user_message
+                captured["conversation_history"] = conversation_history
+                return {
+                    "final_response": json.dumps(
+                        {
+                            "summary": "还有 3 条未处理提醒。",
+                            "guidance": "请今天补齐备注。",
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+
+        body = {
+            "mode": "summary_guidance",
+            "prompt_text": "Tower summary prompt only.",
+            "prompt_version": "summary-v1",
+            "summary_input": {
+                "owner_name": "张三",
+                "warning_count": 2,
+                "notice_count": 1,
+                "total_count": 3,
+            },
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("run_agent.AIAgent", FakeAgent), patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={"provider": "nous", "api_key": "k", "base_url": "https://example.com", "api_mode": "chat_completions", "command": None, "args": [], "credential_pool": None},
+            ), patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None):
+                resp = await cli.post(
+                    "/api/tower/sales-target/progress-reminder/summary-guidance",
+                    json=body,
+                    headers={"Authorization": "Bearer secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["summary"] == "还有 3 条未处理提醒。"
+        assert data["guidance"] == "请今天补齐备注。"
+        assert data["message"] == "还有 3 条未处理提醒。\n请今天补齐备注。"
+        assert "Tower summary prompt only." in captured["agent_kwargs"]["ephemeral_system_prompt"]
+        assert "summary-v1" in captured["user_message"]
+        assert captured["conversation_history"] == []
 
     @pytest.mark.asyncio
     async def test_job_callbacks_failed_items_when_review_raises(self):

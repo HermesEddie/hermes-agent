@@ -536,6 +536,8 @@ class APIServerAdapter(BasePlatformAdapter):
         unexpected: List[str] = []
 
         for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
             node_key = str(raw_item.get("node_key") or "").strip()
             if not node_key:
                 continue
@@ -583,7 +585,11 @@ class APIServerAdapter(BasePlatformAdapter):
             result_status = "completed"
 
         judgment = str(raw_item.get("judgment") or "").strip().lower() or None
-        if judgment not in {None, "pass", "need_more_info", "invalid"}:
+        if judgment == "need_more_info":
+            judgment = "manual_review"
+        elif judgment == "invalid":
+            judgment = "reject"
+        if judgment not in {None, "pass", "manual_review", "reject"}:
             raise ValueError(f"Invalid judgment for node {node_key}: {judgment}")
 
         score = raw_item.get("score")
@@ -1595,6 +1601,8 @@ class APIServerAdapter(BasePlatformAdapter):
         expected_node_keys = self._tower_expected_node_keys(context_items)
         guidance = review_guidance if isinstance(review_guidance, dict) else {}
         guidance_prompt = str(guidance.get("prompt_text") or "").strip()
+        if not guidance_prompt:
+            raise ValueError("Tower review_guidance.prompt_text is required")
         guidance_payload = {
             key: value
             for key, value in guidance.items()
@@ -1602,9 +1610,11 @@ class APIServerAdapter(BasePlatformAdapter):
         }
 
         system_prompt = (
-            "You are Hermes reviewing Amazon sales target reasonableness for a BP management workflow.\n"
+            "You are Hermes executing a Tower-provided review instruction.\n"
             "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
-            "The Tower review policy below is authoritative. Apply it before the fallback schema rules.\n"
+            "Use the Tower prompt below as the only business judgment instruction.\n"
+            "Do not add business rules, examples, defaults, or fallback policy of your own.\n\n"
+            "Tower prompt:\n"
             f"{guidance_prompt}\n\n"
             "Output schema:\n"
             "{\n"
@@ -1612,7 +1622,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "    {\n"
             '      "node_key": "string",\n'
             '      "score": 1.0,\n'
-            '      "judgment": "pass|need_more_info|invalid",\n'
+            '      "judgment": "pass|manual_review|reject",\n'
             '      "note": "short explanation",\n'
             '      "summary": "one-line summary",\n'
             '      "transfer_impact_level": "low|medium|high",\n'
@@ -1624,22 +1634,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "    }\n"
             "  ]\n"
             "}\n"
-            "Rules:\n"
-            "- pass: the reason is specific and consistent with inventory/progress/history.\n"
-            "- need_more_info: the reason may be plausible but lacks critical support.\n"
-            "- invalid: the reason clearly conflicts with the supplied data.\n"
+            "Protocol rules:\n"
             "- score must be between 1.0 and 5.0.\n"
+            "- judgment must be one of pass, manual_review, reject.\n"
             "- include every input node_key exactly once.\n"
-            "- never omit a node_key even if you are uncertain; use need_more_info for uncertainty.\n"
             "- never merge two node_keys into one result item.\n"
             "- never return fewer items than the number of input node_keys.\n"
             "- evidence must quote only from supplied fields.\n"
-            "- if Tower policy conflicts with fallback rules, Tower policy wins.\n"
-            "Few-shot examples (follow the policy, do not copy text):\n"
-            "1) promotion + short note like '活动中' + hero/main variant + high grade + active replenish_status + sufficient sellable/in_transit + no direct contradiction => pass, because action signal exists and supply/history can carry the target.\n"
-            "2) ads + explicit action signal + hero variant + inventory support => pass, even if the ad plan is not written as a detailed budget document.\n"
-            "3) issue_type=other but issue_note or previous-week note says '6月PD' or 'Prime Day' + hero/high-grade + sufficient stock => treat it as a real promotion signal and prefer pass unless there is direct contradiction.\n"
-            "4) promotion on a D-grade tail variant with very large uplift, weak support, and clear mismatch against supply/history => invalid.\n"
         )
 
         def _run(review_system_prompt: str, review_user_message: str):
@@ -1727,7 +1728,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         + "- Return one item for every required node_key, exactly once.\n"
                         + "- Do not omit any required node_key.\n"
                         + "- Do not include unexpected node_keys.\n"
-                        + "- If one item is uncertain, still emit need_more_info for that node_key.\n"
+                        + "- Normalize legacy judgment need_more_info to manual_review and invalid to reject.\n"
+                        + "- Do not introduce new business reasoning while repairing structure.\n"
                     )
                     repair_user_message = (
                         f"Task ID: {task_id}\n"
@@ -1755,7 +1757,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 by_node_key = {
                     str(item.get("node_key") or "").strip(): item
                     for item in raw_items
-                    if str(item.get("node_key") or "").strip()
+                    if isinstance(item, dict) and str(item.get("node_key") or "").strip()
                 }
             except Exception as exc:
                 return [
@@ -1795,6 +1797,145 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             )
         return normalized_results
+
+    async def _run_tower_progress_summary_guidance(
+        self,
+        *,
+        request_id: str,
+        runtime_model: str,
+        prompt_version: str,
+        prompt_text: str,
+        summary_input: Dict[str, Any],
+    ) -> Dict[str, str | None]:
+        """Run the Tower-provided summary guidance prompt and return structured text."""
+        guidance_prompt = str(prompt_text or "").strip()
+        if not guidance_prompt:
+            raise ValueError("prompt_text is required")
+        loop = asyncio.get_event_loop()
+        system_prompt = (
+            "You are Hermes executing a Tower-provided summary guidance instruction.\n"
+            "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
+            "Use the Tower prompt below as the only content guidance.\n"
+            "Do not add fallback wording of your own.\n\n"
+            "Tower prompt:\n"
+            f"{guidance_prompt}\n\n"
+            "Output schema:\n"
+            "{\n"
+            '  "summary": "short summary",\n'
+            '  "guidance": "short actionable guidance",\n'
+            '  "message": "optional combined message"\n'
+            "}\n"
+            "Protocol rules:\n"
+            "- Use only the supplied summary_input fields.\n"
+            "- Do not recalculate or alter supplied counts.\n"
+            "- Return at least one non-empty value among summary, guidance, or message.\n"
+        )
+        user_message = (
+            f"Request ID: {request_id}\n"
+            f"Prompt version: {prompt_version}\n\n"
+            "summary_input:\n"
+            f"{json.dumps(summary_input, ensure_ascii=False, indent=2)}"
+        )
+
+        def _run() -> str:
+            from run_agent import AIAgent
+            from gateway.run import _resolve_runtime_agent_kwargs, GatewayRunner
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            fallback_model = GatewayRunner._load_fallback_model()
+            agent = AIAgent(
+                model=runtime_model,
+                **runtime_kwargs,
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                ephemeral_system_prompt=system_prompt,
+                enabled_toolsets=[],
+                session_id=f"tower_summary_{request_id}",
+                platform="api_server",
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=None,
+                persist_session=False,
+                fallback_model=fallback_model,
+            )
+            result = agent.run_conversation(
+                user_message=user_message,
+                conversation_history=[],
+            )
+            return result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+        raw_response = await loop.run_in_executor(None, _run)
+        parsed = _extract_json_from_text(raw_response)
+        if not isinstance(parsed, dict):
+            raise ValueError("Hermes summary_guidance output was not valid JSON")
+        summary = str(parsed.get("summary") or "").strip() or None
+        guidance = str(parsed.get("guidance") or "").strip() or None
+        message = str(parsed.get("message") or "").strip() or None
+        if not message and (summary or guidance):
+            message = "\n".join(part for part in (summary, guidance) if part)
+        if not any((summary, guidance, message)):
+            raise ValueError("Hermes summary_guidance output was empty")
+        return {
+            "summary": summary,
+            "guidance": guidance,
+            "message": message,
+        }
+
+    async def _handle_tower_progress_summary_guidance_body(
+        self,
+        body: Dict[str, Any],
+        *,
+        request_id: str,
+    ) -> "web.Response":
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        prompt_text = str(body.get("prompt_text") or "").strip()
+        summary_input = body.get("summary_input")
+        if not prompt_text:
+            return web.json_response(_tower_error("prompt_text is required", "missing_prompt_text"), status=400)
+        if not isinstance(summary_input, dict):
+            return web.json_response(_tower_error("summary_input must be an object", "invalid_summary_input"), status=400)
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = self._resolve_tower_review_runtime_model(
+            body,
+            runtime_provider=str(runtime_kwargs.get("provider") or "").strip() or None,
+        )
+        prompt_version = str(body.get("prompt_version") or "v1").strip() or "v1"
+        try:
+            result = await self._run_tower_progress_summary_guidance(
+                request_id=request_id,
+                runtime_model=runtime_model,
+                prompt_version=prompt_version,
+                prompt_text=prompt_text,
+                summary_input=summary_input,
+            )
+        except ValueError as exc:
+            return web.json_response(_tower_error(str(exc), "invalid_summary_guidance_output"), status=502)
+        except Exception as exc:
+            logger.exception("[api_server] tower summary_guidance request %s failed", request_id)
+            return web.json_response(_tower_error(str(exc), "summary_guidance_failed"), status=500)
+        return web.json_response(
+            {
+                "request_id": request_id,
+                "prompt_version": prompt_version,
+                **result,
+            },
+            status=200,
+        )
+
+    async def _handle_tower_progress_summary_guidance(self, request: "web.Request") -> "web.Response":
+        """POST /api/tower/sales-target/progress-reminder/summary-guidance."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
+        request_id = f"tower_summary_{uuid.uuid4().hex}"
+        return await self._handle_tower_progress_summary_guidance_body(body, request_id=request_id)
 
     async def _fetch_tower_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch batch review context from Tower using the shared internal token."""
@@ -1927,6 +2068,9 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
+        if str(body.get("mode") or "").strip() == "summary_guidance":
+            request_id = f"tower_summary_{uuid.uuid4().hex}"
+            return await self._handle_tower_progress_summary_guidance_body(body, request_id=request_id)
 
         required_fields = [
             "task_id",
@@ -2272,6 +2416,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/api/tower/sales-target/agent-review", self._handle_tower_sales_target_review)
+            self._app.router.add_post(
+                "/api/tower/sales-target/progress-reminder/summary-guidance",
+                self._handle_tower_progress_summary_guidance,
+            )
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
