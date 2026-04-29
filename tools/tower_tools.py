@@ -1,4 +1,4 @@
-"""Tower system tools for FAQ lookup and target approval review."""
+"""Tower system tools for FAQ/RAG lookup and target approval review."""
 
 from __future__ import annotations
 
@@ -74,6 +74,14 @@ def _matches_to_dicts(matches: tuple[Any, ...]) -> list[dict[str, Any]]:
     return items
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [_string(item) for item in value if _string(item)]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
 async def tower_faq_query_tool(args: dict[str, Any], **_: Any) -> str:
     """Query Tower FAQ explicitly at the agent's discretion."""
     from gateway.tower_faq import TowerFaqClient
@@ -107,6 +115,50 @@ async def tower_faq_query_tool(args: dict[str, Any], **_: Any) -> str:
             "answer_mode_hint": result.answer_mode_hint,
             "response_text": result.gateway_response_text(polish_answers=client.settings.polish_answers),
             "matches": _matches_to_dicts(result.matches),
+        }
+    )
+
+
+async def tower_rag_query_tool(args: dict[str, Any], **_: Any) -> str:
+    """Query Tower RAG knowledge base explicitly at the agent's discretion."""
+    from gateway.tower_rag import TowerRagClient
+
+    question = _string(args.get("question"))
+    if not question:
+        return _json({"success": False, "error": "question is required", "code": "missing_question"})
+
+    tenant_id = _string(args.get("tenant_id") or args.get("tenantId"))
+    client = TowerRagClient.from_config(_load_config_mapping())
+    result = await client.query_question(
+        question,
+        tenant_id=tenant_id,
+        agent_id=_string(args.get("agent_id") or args.get("agentId")),
+        user_id=_string(args.get("user_id") or args.get("userId")),
+        user_roles=_string_list(args.get("user_roles") or args.get("userRoles")),
+        module=_string(args.get("module")) or None,
+    )
+    if result is None:
+        code = "tower_rag_no_result"
+        if not client.settings.is_configured():
+            code = "tower_rag_not_configured"
+        elif not tenant_id and not client.settings.default_tenant_id:
+            code = "tower_rag_missing_tenant"
+        return _json(
+            {
+                "success": False,
+                "error": "Tower RAG query did not return a result.",
+                "code": code,
+            }
+        )
+
+    return _json(
+        {
+            "success": True,
+            "tenant_id": result.tenant_id,
+            "question_hash": result.question_hash,
+            "response_context": result.response_context(),
+            "matches": list(result.matches),
+            "citations": result.citations(),
         }
     )
 
@@ -220,6 +272,54 @@ registry.register(
     handler=tower_faq_query_tool,
     is_async=True,
     description="Query Tower FAQ library",
+    emoji="🏢",
+)
+
+registry.register(
+    name="tower_rag_query",
+    toolset="tower",
+    schema={
+        "name": "tower_rag_query",
+        "description": (
+            "Query the Tower RAG knowledge base for business documents, rules, "
+            "operation manuals, data definitions, and product materials. Use when "
+            "the user asks a Tower business-context question that may need document citations."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The complete user question, including relevant session context.",
+                },
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Tower tenant id. Optional when configured by Hermes profile.",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Hermes agent id used by Tower knowledge permissions.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Tower user id when available for permission filtering.",
+                },
+                "user_roles": {
+                    "type": "array",
+                    "description": "Tower role codes for permission filtering.",
+                    "items": {"type": "string"},
+                },
+                "module": {
+                    "type": "string",
+                    "description": "Optional Tower business module filter, such as 销售目标 or 库存.",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    handler=tower_rag_query_tool,
+    is_async=True,
+    description="Query Tower RAG knowledge base",
     emoji="🏢",
 )
 
