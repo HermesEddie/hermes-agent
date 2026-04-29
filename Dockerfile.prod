@@ -3,6 +3,7 @@
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 
+FROM --platform=$TARGETPLATFORM tianon/gosu:1.19-trixie@sha256:3b176695959c71e123eb390d427efc665eeb561b1540e82679c15e992006b8b9 AS gosu_source
 FROM --platform=$TARGETPLATFORM python:3.11-slim AS base
 
 ENV PYTHONUNBUFFERED=1 \
@@ -28,7 +29,8 @@ RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\n' >/etc/apt/apt.c
         ffmpeg \
         git \
         ripgrep \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10000 -m -d /opt/data hermes
 
 FROM base AS py-deps
 
@@ -40,10 +42,12 @@ RUN python -m venv /opt/venv \
 
 FROM base AS runtime-core
 
+COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
 COPY --from=py-deps /opt/venv /opt/venv
 COPY . /opt/hermes
 
-RUN chmod +x /opt/hermes/docker/entrypoint.sh \
+RUN ln -s /opt/venv /opt/hermes/.venv \
+    && chmod +x /opt/hermes/docker/entrypoint.sh \
     && printf '%s\n' '#!/usr/bin/env bash' 'exec python -m hermes_cli.main "$@"' > /usr/local/bin/hermes \
     && chmod +x /usr/local/bin/hermes
 
