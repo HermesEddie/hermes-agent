@@ -597,6 +597,7 @@ class GatewayRunner:
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
         self._update_prompt_pending: Dict[str, bool] = {}
+        self._tower_faq_pending_clarifications: Dict[str, Any] = {}
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -2912,6 +2913,10 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
+        faq_response = await self._maybe_handle_tower_faq_preflight(event, source)
+        if faq_response is not None:
+            return faq_response
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -2932,6 +2937,33 @@ class GatewayRunner:
             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
                 del self._running_agents[_quick_key]
             self._running_agents_ts.pop(_quick_key, None)
+
+    async def _maybe_handle_tower_faq_preflight(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        try:
+            from gateway.tower_faq import TowerFaqClient
+
+            client = TowerFaqClient.from_config(_load_gateway_config())
+            pending = getattr(self, "_tower_faq_pending_clarifications", None)
+            if pending is None:
+                pending = {}
+                self._tower_faq_pending_clarifications = pending
+            pending_response = client.resolve_pending_response(event, source, pending)
+            if pending_response is not None:
+                return pending_response
+            if not client.should_query(event, source):
+                return None
+            result = await client.query(event, source)
+            if result is None:
+                return None
+            client.update_pending_clarification(source, result, pending)
+            return result.gateway_response_text(polish_answers=client.settings.polish_answers)
+        except Exception as exc:
+            logger.warning("Tower FAQ preflight skipped after error: %s", exc)
+            return None
 
     async def _prepare_inbound_message_text(
         self,

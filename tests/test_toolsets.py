@@ -21,6 +21,12 @@ class TestGetToolset:
         assert ts is not None
         assert "web_search" in ts["tools"]
 
+    def test_tower_toolset(self):
+        ts = get_toolset("tower")
+        assert ts is not None
+        assert "tower_faq_query" in ts["tools"]
+        assert "tower_target_approval_review" in ts["tools"]
+
     def test_unknown_returns_none(self):
         assert get_toolset("nonexistent") is None
 

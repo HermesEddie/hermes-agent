@@ -38,6 +38,23 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    for key in (
+        "TOWER_FAQ_ENABLED",
+        "TOWER_BASE_URL",
+        "TOWER_API_BASE_URL",
+        "TOWER_FAQ_QUERY_URL",
+        "TOWER_FAQ_RETRIEVAL_MODE",
+        "TOWER_FAQ_LIMIT",
+        "TOWER_FAQ_TIMEOUT_SECONDS",
+        "TOWER_FAQ_MAX_QUESTION_CHARS",
+        "TOWER_DEFAULT_TENANT_ID",
+        "TOWER_TENANT_ID",
+        "TOWER_INTERNAL_TOKEN",
+        "AGENT_WORKSPACE_TENANT_ID",
+        "AGENT_WORKSPACE_INTERNAL_TOKEN",
+        "SALES_TARGET_AGENT_INTERNAL_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
     # Avoid making real calls during tests if this key is set in the env files
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
