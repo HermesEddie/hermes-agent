@@ -105,6 +105,38 @@ def recommended_update_command() -> str:
     return get_managed_update_command() or "hermes update"
 
 
+def get_container_exec_info() -> Optional[Dict[str, str]]:
+    """Return host-side container exec metadata, if container mode is enabled."""
+    if os.getenv("HERMES_DEV") == "1":
+        return None
+
+    from hermes_constants import is_container
+
+    if is_container():
+        return None
+
+    container_mode_path = get_hermes_home() / ".container-mode"
+    if not container_mode_path.exists():
+        return None
+
+    values = {
+        "backend": "docker",
+        "container_name": "hermes-agent",
+        "exec_user": "hermes",
+        "hermes_bin": "/data/current-package/bin/hermes",
+    }
+    with open(container_mode_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key in values:
+                values[key] = value.strip()
+    return values
+
+
 def format_managed_message(action: str = "modify this Hermes installation") -> str:
     """Build a user-facing error for managed installs."""
     managed_system = get_managed_system() or "a package manager"
