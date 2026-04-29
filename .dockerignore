@@ -10,6 +10,12 @@ node_modules
 # CI/CD
 .github
 
+# Local build/runtime artifacts
+.artifacts
+.omx
+.DS_Store
+**/.DS_Store
+
 # Environment files
 .env
 
