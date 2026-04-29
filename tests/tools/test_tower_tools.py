@@ -10,6 +10,26 @@ import pytest
 from gateway.tower_faq import TowerFaqClient, TowerFaqMatch, TowerFaqQueryResult
 
 
+def _rag_match(**overrides):
+    data = {
+        "chunk_id": "chunk-1",
+        "document_id": "doc-1",
+        "title": "销售目标核对规则",
+        "content": "目标异常需要结合去年同期、近三个月销量和库存水位判断。",
+        "score": 0.88,
+        "score_breakdown": {"keyword": 0.7, "vector": 0.95, "final": 0.88},
+        "source": {
+            "document_name": "销售目标核对规则.pdf",
+            "file_type": "pdf",
+            "module": "销售目标",
+            "page_no": 12,
+            "section_path": "销售目标 > 目标核对",
+        },
+    }
+    data.update(overrides)
+    return data
+
+
 def _match(**overrides) -> TowerFaqMatch:
     data = {
         "faq_id": "faq-1",
@@ -55,6 +75,55 @@ async def test_tower_faq_query_tool_returns_structured_result(monkeypatch):
     assert result["answer_mode_hint"] == "direct_answer"
     assert "先确认责任归因，再按赔付制度执行。" in result["response_text"]
     assert result["matches"][0]["faq_id"] == "faq-1"
+
+
+@pytest.mark.asyncio
+async def test_tower_rag_query_tool_returns_chunks_and_citations(monkeypatch):
+    from gateway.tower_rag import TowerRagClient, TowerRagQueryResult
+    from tools.tower_tools import tower_rag_query_tool
+
+    async def fake_query_question(
+        self,
+        question,
+        *,
+        tenant_id="",
+        agent_id="",
+        user_id="",
+        user_roles=None,
+        module=None,
+    ):
+        assert question == "销售目标异常怎么判断？"
+        assert tenant_id == "tenant-1"
+        assert agent_id == "tower_system"
+        assert user_id == "user-1"
+        assert user_roles == ["sales_manager"]
+        assert module == "销售目标"
+        return TowerRagQueryResult(
+            tenant_id="tenant-1",
+            question_hash="hash-1",
+            matches=(_rag_match(),),
+        )
+
+    monkeypatch.setattr(TowerRagClient, "query_question", fake_query_question)
+
+    result = json.loads(
+        await tower_rag_query_tool(
+            {
+                "question": "销售目标异常怎么判断？",
+                "tenant_id": "tenant-1",
+                "agent_id": "tower_system",
+                "user_id": "user-1",
+                "user_roles": ["sales_manager"],
+                "module": "销售目标",
+            }
+        )
+    )
+
+    assert result["success"] is True
+    assert result["tenant_id"] == "tenant-1"
+    assert result["matches"][0]["chunk_id"] == "chunk-1"
+    assert result["citations"][0]["document_name"] == "销售目标核对规则.pdf"
+    assert "第 12 页" in result["response_context"]
 
 
 @pytest.mark.asyncio

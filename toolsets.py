@@ -61,7 +61,7 @@ _HERMES_CORE_TOOLS = [
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Tower business tools
-    "tower_faq_query", "tower_target_approval_review",
+    "tower_faq_query", "tower_rag_query", "tower_target_approval_review",
 ]
 
 
@@ -204,8 +204,8 @@ TOOLSETS = {
     },
 
     "tower": {
-        "description": "Tower FAQ lookup and target approval review tools",
-        "tools": ["tower_faq_query", "tower_target_approval_review"],
+        "description": "Tower FAQ/RAG lookup and target approval review tools",
+        "tools": ["tower_faq_query", "tower_rag_query", "tower_target_approval_review"],
         "includes": []
     },
 
