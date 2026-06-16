@@ -151,7 +151,9 @@ class TestTowerSalesTargetJob:
         )
         callback_mock = AsyncMock()
 
-        with patch.object(adapter, "_fetch_tower_context", fetch_mock), patch.object(
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "nous"}), patch.object(
+            adapter, "_fetch_tower_context", fetch_mock
+        ), patch.object(
             adapter, "_run_tower_sales_target_review", run_mock
         ), patch.object(adapter, "_post_tower_results", callback_mock):
             await adapter._run_tower_sales_target_review_job(payload, "req-1")
@@ -360,6 +362,58 @@ class TestTowerSalesTargetJob:
         assert result[0]["judgment"] == "pass"
         assert result[1]["judgment"] == "manual_review"
 
+    @pytest.mark.asyncio
+    async def test_review_repairs_invalid_json_response(self):
+        adapter = _make_adapter()
+        captured: dict[str, object] = {"calls": 0, "messages": []}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, user_message, conversation_history):
+                captured["calls"] += 1
+                captured["messages"].append(user_message)
+                if captured["calls"] == 1:
+                    return {"final_response": "not-json: pass asin-1"}
+                return {
+                    "final_response": json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "node_key": "asin-1",
+                                    "score": 4.1,
+                                    "judgment": "pass",
+                                    "note": "动作信号成立",
+                                    "summary": "可通过",
+                                    "missing_fields": [],
+                                    "evidence": [{"label": "issue_note", "value": "活动中"}],
+                                    "recommended_action": "继续观察",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+
+        with patch("run_agent.AIAgent", FakeAgent), patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"provider": "nous", "api_key": "k", "base_url": "https://example.com", "api_mode": "chat_completions", "command": None, "args": [], "credential_pool": None},
+        ), patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None):
+            result = await adapter._run_tower_sales_target_review(
+                request_id="req-1",
+                task_id="task-1",
+                runtime_model="z-ai/glm-5.1",
+                prompt_version="sales_target_default_pass_v4",
+                context_items=[{"node_key": "asin-1", "issue_note": "活动中"}],
+                review_guidance={"prompt_text": "Tower review prompt."},
+            )
+
+        assert captured["calls"] == 2
+        assert "Previous invalid/incomplete output" in captured["messages"][1]
+        assert result[0]["node_key"] == "asin-1"
+        assert result[0]["judgment"] == "pass"
+
     def test_normalizes_legacy_tower_judgments_to_current_enum(self):
         adapter = _make_adapter()
 
@@ -374,6 +428,72 @@ class TestTowerSalesTargetJob:
 
         assert manual["judgment"] == "manual_review"
         assert rejected["judgment"] == "reject"
+
+    @pytest.mark.asyncio
+    async def test_job_limits_concurrent_sales_target_reviews(self, monkeypatch):
+        adapter = _make_adapter()
+        active_jobs = 0
+        max_active_jobs = 0
+        lock = asyncio.Lock()
+
+        async def fake_fetch(payload):
+            return {
+                "review_guidance": {"prompt_text": "Tower review prompt."},
+                "items": [{"node_key": payload["node_keys"][0], "issue_note": "活动中"}],
+            }
+
+        async def fake_run(**kwargs):
+            nonlocal active_jobs, max_active_jobs
+            async with lock:
+                active_jobs += 1
+                max_active_jobs = max(max_active_jobs, active_jobs)
+            await asyncio.sleep(0.02)
+            async with lock:
+                active_jobs -= 1
+            return [
+                {
+                    "node_key": kwargs["context_items"][0]["node_key"],
+                    "result_status": "completed",
+                    "score": 4.2,
+                    "judgment": "pass",
+                    "note": "动作信号成立",
+                    "summary": "可通过",
+                    "missing_fields": [],
+                    "evidence": [],
+                    "recommended_action": "继续观察",
+                }
+            ]
+
+        callback_mock = AsyncMock()
+        payloads = [
+            {
+                "task_id": f"task-{index}",
+                "tenant_id": "tenant-1",
+                "view_id": "view-1",
+                "start_month": "2026-04",
+                "node_keys": [f"asin-{index}"],
+                "context_url": "http://tower/context",
+                "callback_url": "http://tower/callback",
+                "prompt_version": "v1",
+            }
+            for index in range(4)
+        ]
+
+        monkeypatch.setenv("TOWER_AGENT_REVIEW_MAX_CONCURRENT_JOBS", "2")
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "nous"}), patch.object(
+            adapter, "_fetch_tower_context", side_effect=fake_fetch
+        ), patch.object(adapter, "_run_tower_sales_target_review", side_effect=fake_run), patch.object(
+            adapter, "_post_tower_results", callback_mock
+        ):
+            await asyncio.gather(
+                *[
+                    adapter._run_tower_sales_target_review_job(payload, f"req-{index}")
+                    for index, payload in enumerate(payloads)
+                ]
+            )
+
+        assert callback_mock.await_count == 4
+        assert max_active_jobs <= 2
 
     @pytest.mark.asyncio
     async def test_summary_guidance_route_uses_tower_prompt(self):
@@ -447,7 +567,9 @@ class TestTowerSalesTargetJob:
         fetch_mock = AsyncMock(return_value={"items": [{"node_key": "asin-1"}, {"node_key": "asin-2"}]})
         callback_mock = AsyncMock()
 
-        with patch.object(adapter, "_fetch_tower_context", fetch_mock), patch.object(
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "nous"}), patch.object(
+            adapter, "_fetch_tower_context", fetch_mock
+        ), patch.object(
             adapter, "_run_tower_sales_target_review", AsyncMock(side_effect=RuntimeError("model exploded"))
         ), patch.object(adapter, "_post_tower_results", callback_mock):
             await adapter._run_tower_sales_target_review_job(payload, "req-2")

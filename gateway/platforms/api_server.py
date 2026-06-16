@@ -51,6 +51,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+TOWER_REVIEW_MAX_CONCURRENT_JOBS_DEFAULT = 3
+TOWER_REVIEW_MAX_CONCURRENT_JOBS_LIMIT = 10
 
 
 def check_api_server_requirements() -> bool:
@@ -355,6 +357,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._tower_review_job_semaphore: Optional[asyncio.Semaphore] = None
+        self._tower_review_job_semaphore_limit: Optional[int] = None
+        self._tower_review_job_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -578,6 +583,32 @@ class APIServerAdapter(BasePlatformAdapter):
             context_items[index:index + chunk_size]
             for index in range(0, len(context_items), chunk_size)
         ] or [[]]
+
+    @staticmethod
+    def _tower_review_max_concurrent_jobs() -> int:
+        raw = (
+            os.getenv("TOWER_AGENT_REVIEW_MAX_CONCURRENT_JOBS")
+            or os.getenv("TOWER_SALES_TARGET_REVIEW_MAX_CONCURRENT_JOBS")
+            or str(TOWER_REVIEW_MAX_CONCURRENT_JOBS_DEFAULT)
+        )
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = TOWER_REVIEW_MAX_CONCURRENT_JOBS_DEFAULT
+        return max(1, min(value, TOWER_REVIEW_MAX_CONCURRENT_JOBS_LIMIT))
+
+    def _tower_review_job_gate(self) -> asyncio.Semaphore:
+        limit = self._tower_review_max_concurrent_jobs()
+        loop = asyncio.get_running_loop()
+        if (
+            self._tower_review_job_semaphore is None
+            or self._tower_review_job_semaphore_limit != limit
+            or self._tower_review_job_semaphore_loop is not loop
+        ):
+            self._tower_review_job_semaphore = asyncio.Semaphore(limit)
+            self._tower_review_job_semaphore_limit = limit
+            self._tower_review_job_semaphore_loop = loop
+        return self._tower_review_job_semaphore
 
     def _normalize_tower_result_item(self, raw_item: Dict[str, Any], *, node_key: str) -> Dict[str, Any]:
         result_status = str(raw_item.get("result_status") or "completed").strip().lower() or "completed"
@@ -1696,6 +1727,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 f"{json.dumps(chunk_items, ensure_ascii=False, indent=2)}"
             )
 
+        async def _repair_chunk_output(
+            *,
+            raw_response: str,
+            chunk_items: List[Dict[str, Any]],
+            chunk_node_keys: List[str],
+            chunk_index: int,
+            chunk_count: int,
+            integrity: Dict[str, List[str]],
+        ) -> Optional[List[Dict[str, Any]]]:
+            repair_system_prompt = (
+                system_prompt
+                + "\nRepair mode:\n"
+                + "- You must repair the previous output into valid JSON.\n"
+                + "- Return one item for every required node_key, exactly once.\n"
+                + "- Do not omit any required node_key.\n"
+                + "- Do not include unexpected node_keys.\n"
+                + "- Normalize legacy judgment need_more_info to manual_review and invalid to reject.\n"
+                + "- Do not introduce new business reasoning while repairing structure.\n"
+            )
+            repair_user_message = (
+                f"Task ID: {task_id}\n"
+                f"Request ID: {request_id}\n"
+                f"Model hint: {runtime_model}\n"
+                f"Prompt version: {prompt_version}\n"
+                f"Chunk: {chunk_index}/{chunk_count}\n\n"
+                f"Required node_keys: {json.dumps(chunk_node_keys, ensure_ascii=False)}\n"
+                f"Missing node_keys: {json.dumps(integrity.get('missing') or [], ensure_ascii=False)}\n"
+                f"Duplicate node_keys: {json.dumps(integrity.get('duplicates') or [], ensure_ascii=False)}\n"
+                f"Unexpected node_keys: {json.dumps(integrity.get('unexpected') or [], ensure_ascii=False)}\n\n"
+                "Previous invalid/incomplete output:\n"
+                f"{raw_response}\n\n"
+                "Original review items:\n"
+                f"{json.dumps(chunk_items, ensure_ascii=False, indent=2)}"
+            )
+            repaired_response = await _invoke(repair_system_prompt, repair_user_message)
+            repaired = _extract_json_from_text(repaired_response)
+            if not repaired or not isinstance(repaired.get("items"), list):
+                return None
+            repaired_items = repaired.get("items") or []
+            repaired_integrity = self._tower_result_integrity(repaired_items, expected_node_keys=chunk_node_keys)
+            if self._tower_integrity_has_issues(repaired_integrity):
+                return None
+            return repaired_items
+
         async def _review_chunk(
             *,
             chunk_items: List[Dict[str, Any]],
@@ -1713,45 +1788,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 raw_response = await _invoke(system_prompt, user_message)
                 parsed = _extract_json_from_text(raw_response)
                 if not parsed:
-                    raise ValueError("Hermes review output was not valid JSON")
-
-                raw_items = parsed.get("items")
-                if not isinstance(raw_items, list):
-                    raise ValueError("Hermes review JSON must contain an 'items' array")
-
-                integrity = self._tower_result_integrity(raw_items, expected_node_keys=chunk_node_keys)
-                if self._tower_integrity_has_issues(integrity):
-                    repair_system_prompt = (
-                        system_prompt
-                        + "\nRepair mode:\n"
-                        + "- You must repair the previous output into valid JSON.\n"
-                        + "- Return one item for every required node_key, exactly once.\n"
-                        + "- Do not omit any required node_key.\n"
-                        + "- Do not include unexpected node_keys.\n"
-                        + "- Normalize legacy judgment need_more_info to manual_review and invalid to reject.\n"
-                        + "- Do not introduce new business reasoning while repairing structure.\n"
+                    repaired_items = await _repair_chunk_output(
+                        raw_response=raw_response,
+                        chunk_items=chunk_items,
+                        chunk_node_keys=chunk_node_keys,
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                        integrity={"missing": chunk_node_keys, "duplicates": [], "unexpected": []},
                     )
-                    repair_user_message = (
-                        f"Task ID: {task_id}\n"
-                        f"Request ID: {request_id}\n"
-                        f"Model hint: {runtime_model}\n"
-                        f"Prompt version: {prompt_version}\n"
-                        f"Chunk: {chunk_index}/{chunk_count}\n\n"
-                        f"Required node_keys: {json.dumps(chunk_node_keys, ensure_ascii=False)}\n"
-                        f"Missing node_keys: {json.dumps(integrity.get('missing') or [], ensure_ascii=False)}\n"
-                        f"Duplicate node_keys: {json.dumps(integrity.get('duplicates') or [], ensure_ascii=False)}\n"
-                        f"Unexpected node_keys: {json.dumps(integrity.get('unexpected') or [], ensure_ascii=False)}\n\n"
-                        "Previous invalid/incomplete output:\n"
-                        f"{raw_response}\n\n"
-                        "Original review items:\n"
-                        f"{json.dumps(chunk_items, ensure_ascii=False, indent=2)}"
-                    )
-                    repaired_response = await _invoke(repair_system_prompt, repair_user_message)
-                    repaired = _extract_json_from_text(repaired_response)
-                    if repaired and isinstance(repaired.get("items"), list):
-                        repaired_items = repaired.get("items") or []
-                        repaired_integrity = self._tower_result_integrity(repaired_items, expected_node_keys=chunk_node_keys)
-                        if not self._tower_integrity_has_issues(repaired_integrity):
+                    if repaired_items is None:
+                        raise ValueError("Hermes review output was not valid JSON")
+                    raw_items = repaired_items
+                else:
+                    raw_items = parsed.get("items")
+                    if not isinstance(raw_items, list):
+                        repaired_items = await _repair_chunk_output(
+                            raw_response=raw_response,
+                            chunk_items=chunk_items,
+                            chunk_node_keys=chunk_node_keys,
+                            chunk_index=chunk_index,
+                            chunk_count=chunk_count,
+                            integrity={"missing": chunk_node_keys, "duplicates": [], "unexpected": []},
+                        )
+                        if repaired_items is None:
+                            raise ValueError("Hermes review JSON must contain an 'items' array")
+                        raw_items = repaired_items
+
+                    integrity = self._tower_result_integrity(raw_items, expected_node_keys=chunk_node_keys)
+                    if self._tower_integrity_has_issues(integrity):
+                        repaired_items = await _repair_chunk_output(
+                            raw_response=raw_response,
+                            chunk_items=chunk_items,
+                            chunk_node_keys=chunk_node_keys,
+                            chunk_index=chunk_index,
+                            chunk_count=chunk_count,
+                            integrity=integrity,
+                        )
+                        if repaired_items is not None:
                             raw_items = repaired_items
 
                 by_node_key = {
@@ -2005,6 +2078,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _run_tower_sales_target_review_job(self, payload: Dict[str, Any], request_id: str) -> None:
         """Background job: fetch Tower context, run Hermes review, callback results."""
+        async with self._tower_review_job_gate():
+            await self._run_tower_sales_target_review_job_unlocked(payload, request_id)
+
+    async def _run_tower_sales_target_review_job_unlocked(self, payload: Dict[str, Any], request_id: str) -> None:
+        """Execute a Tower review job after the adapter-level concurrency gate is acquired."""
         task_id = str(payload.get("task_id") or "").strip()
         tenant_id = str(payload.get("tenant_id") or "").strip()
         from gateway.run import _resolve_runtime_agent_kwargs
