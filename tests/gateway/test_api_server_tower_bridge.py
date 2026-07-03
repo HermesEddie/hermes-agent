@@ -167,6 +167,90 @@ class TestTowerSalesTargetJob:
         assert run_mock.await_args.kwargs["review_guidance"]["prompt_version"] == "sales_target_default_pass_v8"
 
     @pytest.mark.asyncio
+    async def test_job_preserves_task_item_and_attempt_identifiers(self):
+        adapter = _make_adapter()
+        payload = {
+            "task_id": "task-1",
+            "tenant_id": "tenant-1",
+            "view_id": "view-1",
+            "start_month": "2026-04",
+            "node_keys": ["asin-1"],
+            "task_item_ids": ["item-1"],
+            "locator_keys": ["ASIN_SUM|US|B001"],
+            "dispatch_attempt_id": "attempt-1",
+            "context_url": "http://tower/context",
+            "callback_url": "http://tower/callback",
+            "prompt_version": "v1",
+        }
+
+        fetch_mock = AsyncMock(
+            return_value={
+                "review_guidance": {"prompt_text": "Tower review prompt."},
+                "items": [{"node_key": "asin-1", "issue_note": "活动"}],
+            }
+        )
+        run_mock = AsyncMock(
+            return_value=[
+                {
+                    "node_key": "asin-1",
+                    "result_status": "completed",
+                    "score": 4.2,
+                    "judgment": "pass",
+                    "note": "理由充分",
+                    "summary": "可通过",
+                    "missing_fields": [],
+                    "evidence": [],
+                    "recommended_action": "继续观察",
+                }
+            ]
+        )
+        callback_mock = AsyncMock()
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "nous"}), patch.object(
+            adapter, "_fetch_tower_context", fetch_mock
+        ), patch.object(adapter, "_run_tower_sales_target_review", run_mock), patch.object(
+            adapter, "_post_tower_results", callback_mock
+        ):
+            await adapter._run_tower_sales_target_review_job(payload, "req-1")
+
+        callback_item = callback_mock.await_args.kwargs["items"][0]
+        assert callback_item["task_item_id"] == "item-1"
+        assert callback_item["locator_key"] == "ASIN_SUM|US|B001"
+        assert callback_item["dispatch_attempt_id"] == "attempt-1"
+
+    @pytest.mark.asyncio
+    async def test_fetch_context_forwards_stable_item_identifiers(self, monkeypatch):
+        adapter = _make_adapter()
+        captured: dict[str, object] = {}
+
+        async def context_handler(request: web.Request) -> web.Response:
+            captured["body"] = await request.json()
+            return web.json_response({"items": []})
+
+        app = web.Application()
+        app.router.add_post("/context", context_handler)
+        monkeypatch.setenv("AGENT_WORKSPACE_INTERNAL_TOKEN", "tower-token")
+
+        async with TestClient(TestServer(app)) as cli:
+            await adapter._fetch_tower_context(
+                {
+                    "tenant_id": "tenant-1",
+                    "view_id": "view-1",
+                    "start_month": "2026-04",
+                    "node_keys": ["asin-1"],
+                    "task_item_ids": ["item-1"],
+                    "locator_keys": ["ASIN_SUM|US|B001"],
+                    "task_id": "task-1",
+                    "context_url": str(cli.make_url("/context")),
+                }
+            )
+
+        body = captured["body"]
+        assert body["node_keys"] == ["asin-1"]
+        assert body["task_item_ids"] == ["item-1"]
+        assert body["locator_keys"] == ["ASIN_SUM|US|B001"]
+
+    @pytest.mark.asyncio
     async def test_job_prefers_payload_model_name_and_normalizes_for_provider(self, monkeypatch):
         adapter = _make_adapter()
         payload = {
