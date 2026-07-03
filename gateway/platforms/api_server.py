@@ -2026,6 +2026,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "node_keys": payload.get("node_keys") or [],
             "task_id": payload.get("task_id"),
         }
+        task_item_ids = payload.get("task_item_ids") or []
+        locator_keys = payload.get("locator_keys") or []
+        if isinstance(task_item_ids, list) and task_item_ids:
+            body["task_item_ids"] = task_item_ids
+        if isinstance(locator_keys, list) and locator_keys:
+            body["locator_keys"] = locator_keys
 
         import aiohttp
 
@@ -2101,6 +2107,42 @@ class APIServerAdapter(BasePlatformAdapter):
             for node_key in node_keys
         ]
 
+        def _payload_identifier_list(name: str) -> List[str]:
+            values = payload.get(name) or []
+            if not isinstance(values, list):
+                return []
+            return [str(value).strip() for value in values if str(value or "").strip()]
+
+        def _attach_dispatch_identifiers(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            task_item_ids = _payload_identifier_list("task_item_ids")
+            locator_keys = _payload_identifier_list("locator_keys")
+            attempt_id = str(payload.get("dispatch_attempt_id") or payload.get("attempt_id") or "").strip()
+            metadata_by_node: Dict[str, Dict[str, str]] = {}
+            for index, node_key in enumerate(node_keys):
+                meta: Dict[str, str] = {}
+                if index < len(task_item_ids):
+                    meta["task_item_id"] = task_item_ids[index]
+                if index < len(locator_keys):
+                    meta["locator_key"] = locator_keys[index]
+                if attempt_id:
+                    meta["dispatch_attempt_id"] = attempt_id
+                if node_key and meta:
+                    metadata_by_node[node_key] = meta
+            single_meta = metadata_by_node.get(node_keys[0], {}) if len(node_keys) == 1 else {}
+            enriched: List[Dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    enriched.append(item)
+                    continue
+                result_item = dict(item)
+                node_key = str(result_item.get("node_key") or "").strip()
+                meta = metadata_by_node.get(node_key) or single_meta
+                for key, value in meta.items():
+                    if value and not result_item.get(key):
+                        result_item[key] = value
+                enriched.append(result_item)
+            return enriched
+
         try:
             context_payload = await self._fetch_tower_context(payload)
             context_items = context_payload.get("items") or []
@@ -2121,6 +2163,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._tower_result_failure_item(node_key, str(exc))
                 for node_key in node_keys
             ] or failure_items
+
+        normalized_items = _attach_dispatch_identifiers(normalized_items)
 
         try:
             if not callback_url:
