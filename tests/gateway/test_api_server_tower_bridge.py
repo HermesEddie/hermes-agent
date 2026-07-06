@@ -28,6 +28,11 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/api/tower/sales-target/agent-review", adapter._handle_tower_sales_target_review)
+    app.router.add_post("/api/tower/sales-target/dashboard-analysis", adapter._handle_tower_dashboard_analysis)
+    app.router.add_post(
+        "/api/tower/inventory-health/dashboard-analysis",
+        adapter._handle_tower_inventory_health_dashboard_analysis,
+    )
     app.router.add_post(
         "/api/tower/sales-target/progress-reminder/summary-guidance",
         adapter._handle_tower_progress_summary_guidance,
@@ -108,6 +113,173 @@ class TestTowerSalesTargetRoute:
                 assert data["status"] == "accepted"
                 await asyncio.sleep(0)
                 background_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dashboard_analysis_route_returns_report(self):
+        adapter = _make_adapter(api_key="secret")
+        app = _create_app(adapter)
+        report = {
+            "summary": ["整体目标可控"],
+            "dashboard_findings": [{"title": "目标偏高", "detail": "美国站库存充足"}],
+            "retrospective_findings": [],
+            "top_local_sku_regions": [],
+            "owner_actions": [],
+            "group_message": "整体目标可控",
+            "owner_messages": [],
+        }
+        body = {
+            "task_id": "dashboard-1",
+            "prompt_text": "分析销售目标看板",
+            "prompt_version": "dash-v1",
+            "report_input": {"rows": [{"owner_name": "张三"}]},
+            "scope": {"view": "Skysper"},
+            "data_watermark": {"updated_at": "2026-07-03"},
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "nous"}), patch.object(
+                adapter, "_run_tower_dashboard_analysis", AsyncMock(return_value=report)
+            ) as run_mock:
+                resp = await cli.post(
+                    "/api/tower/sales-target/dashboard-analysis",
+                    json=body,
+                    headers={"Authorization": "Bearer secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["task_id"] == "dashboard-1"
+        assert data["status"] == "completed"
+        assert data["prompt_version"] == "dash-v1"
+        assert data["report"] == report
+        assert run_mock.await_args.kwargs["report_input"] == body["report_input"]
+
+    @pytest.mark.asyncio
+    async def test_dashboard_analysis_route_with_callback_schedules_background_job(self, monkeypatch):
+        adapter = _make_adapter(api_key="secret")
+        app = _create_app(adapter)
+        body = {
+            "task_id": "dashboard-async-1",
+            "tenant_id": "tenant-1",
+            "prompt_text": "分析销售目标看板",
+            "prompt_version": "dash-v1",
+            "report_input": {"rows": [{"owner_name": "张三"}]},
+            "scope": {"view": "Skysper"},
+            "data_watermark": {"updated_at": "2026-07-03"},
+            "callback_url": "http://tower/callback",
+        }
+
+        monkeypatch.setenv("AGENT_WORKSPACE_INTERNAL_TOKEN", "tower-token")
+        background_mock = AsyncMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_tower_dashboard_analysis_job", background_mock, create=True):
+                resp = await cli.post(
+                    "/api/tower/sales-target/dashboard-analysis",
+                    json=body,
+                    headers={"Authorization": "Bearer secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["task_id"] == "dashboard-async-1"
+        assert data["status"] == "accepted"
+        assert data["prompt_version"] == "dash-v1"
+        await asyncio.sleep(0)
+        background_mock.assert_awaited_once()
+        assert background_mock.await_args.args[0] == body
+        assert data["request_id"] == background_mock.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_dashboard_analysis_route_with_callback_requires_tenant_id(self, monkeypatch):
+        adapter = _make_adapter(api_key="secret")
+        app = _create_app(adapter)
+        body = {
+            "task_id": "dashboard-async-1",
+            "prompt_text": "分析销售目标看板",
+            "prompt_version": "dash-v1",
+            "report_input": {"rows": []},
+            "callback_url": "http://tower/callback",
+        }
+
+        monkeypatch.setenv("AGENT_WORKSPACE_INTERNAL_TOKEN", "tower-token")
+        background_mock = AsyncMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_tower_dashboard_analysis_job", background_mock, create=True):
+                resp = await cli.post(
+                    "/api/tower/sales-target/dashboard-analysis",
+                    json=body,
+                    headers={"Authorization": "Bearer secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["code"] == "missing_fields"
+        assert "tenant_id" in data["error"]["message"]
+        background_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inventory_health_dashboard_route_schedules_background_job(self, monkeypatch):
+        adapter = _make_adapter(api_key="secret")
+        app = _create_app(adapter)
+        body = {
+            "task_id": "inventory-1",
+            "tenant_id": "tenant-1",
+            "view_id": "view-1",
+            "snapshot_week": "2026-W27",
+            "prompt_text": "分析库存健康",
+            "report_input": {"rows": [{"local_sku": "SKU-1"}]},
+            "callback_url": "http://tower/callback",
+        }
+
+        monkeypatch.setenv("AGENT_WORKSPACE_INTERNAL_TOKEN", "tower-token")
+        background_mock = AsyncMock()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_tower_inventory_health_dashboard_job", background_mock):
+                resp = await cli.post(
+                    "/api/tower/inventory-health/dashboard-analysis",
+                    json=body,
+                    headers={"Authorization": "Bearer secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["task_id"] == "inventory-1"
+        assert data["status"] == "accepted"
+        await asyncio.sleep(0)
+        background_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_inventory_health_dashboard_route_accepts_empty_report_input(self, monkeypatch):
+        adapter = _make_adapter(api_key="secret")
+        app = _create_app(adapter)
+        body = {
+            "task_id": "inventory-empty-1",
+            "tenant_id": "tenant-1",
+            "view_id": "view-1",
+            "snapshot_week": "2026-W27",
+            "prompt_text": "分析库存健康",
+            "report_input": {},
+            "callback_url": "http://tower/callback",
+        }
+
+        monkeypatch.setenv("AGENT_WORKSPACE_INTERNAL_TOKEN", "tower-token")
+        background_mock = AsyncMock()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_tower_inventory_health_dashboard_job", background_mock):
+                resp = await cli.post(
+                    "/api/tower/inventory-health/dashboard-analysis",
+                    json=body,
+                    headers={"Authorization": "Bearer secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["task_id"] == "inventory-empty-1"
+        assert data["status"] == "accepted"
+        await asyncio.sleep(0)
+        background_mock.assert_awaited_once()
 
 
 class TestTowerSalesTargetJob:
