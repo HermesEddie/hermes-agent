@@ -336,6 +336,22 @@ Activate with `/skin cyberpunk` or `display.skin: cyberpunk` in config.yaml.
 ---
 
 ## Important Policies
+### Fork And Upstream Policy
+
+This repository is Tower's fork of the official Hermes Agent project. Default
+development and validation must target this fork's `origin/main`, plus Tower
+production hotfixes and local Tower business deltas.
+
+- Do not fetch, rebase, merge, or otherwise align with the official
+  `NousResearch/hermes-agent` upstream unless the current thread explicitly
+  asks for an upstream sync.
+- When repairing Tower-specific behavior, preserve and test the fork's
+  production/local differences first instead of chasing unrelated upstream
+  changes.
+- If an upstream sync is explicitly requested, isolate it in a separate
+  worktree and keep that work separate from production hotfix backfills and
+  Tower feature reconciliation.
+
 ### Prompt Caching Must Not Break
 
 Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**

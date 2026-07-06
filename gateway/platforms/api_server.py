@@ -42,6 +42,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+    is_network_accessible,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_NORMALIZED_CONTENT_CHARS = 65_536
+MAX_NORMALIZED_CONTENT_PARTS = 1_000
+MAX_NORMALIZED_CONTENT_DEPTH = 10
+CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 15.0
 TOWER_REVIEW_MAX_CONCURRENT_JOBS_DEFAULT = 3
 TOWER_REVIEW_MAX_CONCURRENT_JOBS_LIMIT = 10
 
@@ -326,6 +331,29 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
     return sha256(repr(subset).encode("utf-8")).hexdigest()
+
+
+def _normalize_chat_content(content: Any, *, _depth: int = 0) -> str:
+    """Normalize OpenAI-style message content parts into bounded plain text."""
+    if _depth > MAX_NORMALIZED_CONTENT_DEPTH:
+        return ""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:MAX_NORMALIZED_CONTENT_CHARS]
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content[:MAX_NORMALIZED_CONTENT_PARTS]:
+            text = _normalize_chat_content(item, _depth=_depth + 1).strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)[:MAX_NORMALIZED_CONTENT_CHARS]
+    if isinstance(content, dict):
+        part_type = str(content.get("type") or "")
+        if part_type in {"text", "input_text", "output_text"}:
+            return _normalize_chat_content(content.get("text"), _depth=_depth + 1)
+        return ""
+    return str(content)[:MAX_NORMALIZED_CONTENT_CHARS]
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -690,6 +718,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        model_name: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
     ) -> Any:
@@ -706,7 +735,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        model = str(model_name or "").strip() or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -791,7 +820,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = _normalize_chat_content(msg.get("content", ""))
             if role == "system":
                 # Accumulate system messages
                 if system_prompt is None:
@@ -827,7 +856,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            session_id = str(uuid.uuid4())
+            session_id = f"api-{uuid.uuid4().hex}"
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -855,10 +884,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     return  # Only show tool start events in chat stream
                 if name.startswith("_"):
                     return  # Skip internal events (_thinking)
-                from agent.display import get_tool_emoji
-                emoji = get_tool_emoji(name)
-                label = preview or name
-                _stream_q.put(f"\n`{emoji} {label}`\n")
+                _stream_q.put({
+                    "event": "hermes.tool.progress",
+                    "tool": name,
+                    "label": preview or name,
+                })
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -867,6 +897,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
+                model_name=model_name,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -884,6 +915,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
+                model_name=model_name,
                 session_id=session_id,
             )
 
@@ -948,7 +980,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         import queue as _q
 
-        sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
         # CORS middleware can't inject headers into StreamResponse after
         # prepare() flushes them, so resolve CORS headers up front.
         origin = request.headers.get("Origin", "")
@@ -971,6 +1007,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
+            last_keepalive = time.time()
             while True:
                 try:
                     delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
@@ -982,26 +1019,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
-                                content_chunk = {
-                                    "id": completion_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                                }
-                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                await self._write_chat_stream_item(response, completion_id, created, model, delta)
                             except _q.Empty:
                                 break
                         break
+                    if time.time() - last_keepalive >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_keepalive = time.time()
                     continue
 
                 if delta is None:  # End of stream sentinel
                     break
 
-                content_chunk = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                }
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                await self._write_chat_stream_item(response, completion_id, created, model, delta)
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -1043,6 +1073,31 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
 
         return response
+
+    async def _write_chat_stream_item(
+        self,
+        response: "web.StreamResponse",
+        completion_id: str,
+        created: int,
+        model: str,
+        item: Any,
+    ) -> None:
+        if isinstance(item, dict) and item.get("event") == "hermes.tool.progress":
+            data = {
+                "tool": item.get("tool"),
+                "label": item.get("label") or item.get("tool"),
+            }
+            await response.write(f"event: hermes.tool.progress\ndata: {json.dumps(data)}\n\n".encode())
+            return
+
+        content_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+        }
+        await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
@@ -1087,18 +1142,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = item.get("content", "")
-                    # Handle content that may be a list of content parts
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "input_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, dict) and part.get("type") == "output_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "\n".join(text_parts)
+                    content = _normalize_chat_content(item.get("content", ""))
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -1121,7 +1165,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                conversation_history.append({
+                    "role": str(entry["role"]),
+                    "content": _normalize_chat_content(entry["content"]),
+                })
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -1155,6 +1202,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
+                model_name=body.get("model", self._model_name),
                 session_id=session_id,
             )
 
@@ -1574,6 +1622,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        model_name: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         agent_ref: Optional[list] = None,
@@ -1595,6 +1644,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
+                model_name=model_name,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
             )
@@ -2010,6 +2060,613 @@ class APIServerAdapter(BasePlatformAdapter):
         request_id = f"tower_summary_{uuid.uuid4().hex}"
         return await self._handle_tower_progress_summary_guidance_body(body, request_id=request_id)
 
+    async def _run_tower_dashboard_analysis(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        runtime_model: str,
+        prompt_version: str,
+        prompt_text: str,
+        report_input: Dict[str, Any],
+        scope: Dict[str, Any],
+        data_watermark: Any,
+    ) -> Dict[str, Any]:
+        """Run Tower sales-target dashboard analysis and return a normalized report."""
+        loop = asyncio.get_event_loop()
+        guidance_prompt = str(prompt_text or "").strip()
+        system_prompt = (
+            "You are Hermes executing a Tower sales-target dashboard analysis task.\n"
+            "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
+            "Use the Tower prompt below as the primary analysis instruction.\n"
+            "Do not invent metrics or change supplied business definitions.\n\n"
+            "Tower prompt:\n"
+            f"{guidance_prompt}\n\n"
+            "Output schema:\n"
+            "{\n"
+            '  "report": {\n'
+            '    "summary": ["overall conclusion"],\n'
+            '    "dashboard_findings": [{"title": "finding", "detail": "evidence"}],\n'
+            '    "retrospective_findings": [{"title": "finding", "detail": "evidence"}],\n'
+            '    "top_local_sku_regions": [{"local_sku": "sku", "region": "region", "owner_name": "owner", "finding": "finding"}],\n'
+            '    "owner_actions": [{"owner_name": "owner", "message": "action"}],\n'
+            '    "group_message": "group-ready summary",\n'
+            '    "owner_messages": [{"owner_name": "owner", "message": "owner-ready message"}]\n'
+            "  }\n"
+            "}\n"
+            "Protocol rules:\n"
+            "- Analyze only supplied report_input and scope fields.\n"
+            "- Include dashboard, retrospective, and TOP Local SKU + region conclusions when data is present.\n"
+            "- If owner scope is present, focus conclusions and owner_messages on that owner.\n"
+            "- Keep group_message concise and suitable for chat delivery.\n"
+        )
+        user_message = (
+            f"Task ID: {task_id}\n"
+            f"Request ID: {request_id}\n"
+            f"Prompt version: {prompt_version}\n"
+            f"Data watermark: {json.dumps(data_watermark, ensure_ascii=False, default=str)}\n\n"
+            "scope:\n"
+            f"{json.dumps(scope, ensure_ascii=False, indent=2, default=str)}\n\n"
+            "report_input:\n"
+            f"{json.dumps(report_input, ensure_ascii=False, indent=2, default=str)}"
+        )
+
+        def _run() -> str:
+            from run_agent import AIAgent
+            from gateway.run import _resolve_runtime_agent_kwargs, GatewayRunner
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            fallback_model = GatewayRunner._load_fallback_model()
+            agent = AIAgent(
+                model=runtime_model,
+                **runtime_kwargs,
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                ephemeral_system_prompt=system_prompt,
+                enabled_toolsets=[],
+                session_id=f"tower_dashboard_{task_id}",
+                platform="api_server",
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=None,
+                persist_session=False,
+                fallback_model=fallback_model,
+            )
+            result = agent.run_conversation(user_message=user_message, conversation_history=[])
+            return result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+        raw_response = await loop.run_in_executor(None, _run)
+        parsed = _extract_json_from_text(raw_response)
+        if not isinstance(parsed, dict):
+            raise ValueError("Hermes dashboard analysis output was not valid JSON")
+        return self._normalize_tower_dashboard_report(parsed)
+
+    @staticmethod
+    def _normalize_tower_dashboard_report(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        report = parsed.get("report") or parsed.get("analysis_report") or parsed.get("analysis") or parsed
+        if not isinstance(report, dict):
+            raise ValueError("Hermes dashboard analysis JSON must contain a report object")
+
+        def _list_value(*keys: str) -> List[Any]:
+            for key in keys:
+                value = report.get(key)
+                if isinstance(value, list):
+                    return value
+            return []
+
+        summary = report.get("summary")
+        if not isinstance(summary, (list, str)):
+            summary = []
+        group_message = str(report.get("group_message") or report.get("groupMessage") or "").strip()
+        if not group_message:
+            if isinstance(summary, str):
+                group_message = summary.strip()
+            elif isinstance(summary, list):
+                group_message = "\n".join(str(item).strip() for item in summary if str(item).strip())
+
+        normalized = {
+            "summary": summary,
+            "dashboard_findings": _list_value("dashboard_findings", "dashboardFindings"),
+            "retrospective_findings": _list_value("retrospective_findings", "retrospectiveFindings"),
+            "top_local_sku_regions": _list_value("top_local_sku_regions", "topLocalSkuRegions"),
+            "owner_actions": _list_value("owner_actions", "ownerActions"),
+            "group_message": group_message,
+            "owner_messages": _list_value("owner_messages", "ownerMessages"),
+        }
+        if not normalized["summary"] and not normalized["group_message"]:
+            raise ValueError("Hermes dashboard analysis report must include summary or group_message")
+        return normalized
+
+    async def _post_tower_dashboard_analysis_result(
+        self,
+        *,
+        callback_url: str,
+        tenant_id: str,
+        request_id: str,
+        model_name: str,
+        prompt_version: str,
+        status: str,
+        report: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Callback Tower with a sales-target dashboard analysis result."""
+        if not self._tower_internal_token():
+            raise RuntimeError("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured")
+
+        import aiohttp
+
+        body: Dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "hermes_request_id": request_id,
+            "model_name": model_name,
+            "prompt_version": prompt_version,
+            "status": status,
+        }
+        if report is not None:
+            body["report"] = report
+        if error_message:
+            body["error_message"] = str(error_message)[:1000]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=body,
+                headers=self._tower_internal_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"Tower dashboard analysis callback failed ({response.status}): {text[:400]}")
+
+    async def _run_tower_dashboard_analysis_job(self, payload: Dict[str, Any], request_id: str) -> None:
+        """Background job: run sales-target dashboard analysis and callback Tower."""
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        callback_url = str(payload.get("callback_url") or "").strip()
+        prompt_version = str(payload.get("prompt_version") or "v1").strip() or "v1"
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = self._resolve_tower_review_runtime_model(
+            payload,
+            runtime_provider=str(runtime_kwargs.get("provider") or "").strip() or None,
+        )
+        try:
+            report = await self._run_tower_dashboard_analysis(
+                request_id=request_id,
+                task_id=str(payload.get("task_id") or request_id),
+                runtime_model=runtime_model,
+                prompt_version=prompt_version,
+                prompt_text=str(payload.get("prompt_text") or ""),
+                report_input=payload.get("report_input") if isinstance(payload.get("report_input"), dict) else {},
+                scope=payload.get("scope") if isinstance(payload.get("scope"), dict) else {},
+                data_watermark=payload.get("data_watermark"),
+            )
+            await self._post_tower_dashboard_analysis_result(
+                callback_url=callback_url,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                model_name=runtime_model,
+                prompt_version=prompt_version,
+                status="completed",
+                report=report,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] tower dashboard analysis request %s failed", request_id)
+            if not callback_url:
+                return
+            try:
+                await self._post_tower_dashboard_analysis_result(
+                    callback_url=callback_url,
+                    tenant_id=tenant_id,
+                    request_id=request_id,
+                    model_name=runtime_model,
+                    prompt_version=prompt_version,
+                    status="failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("[api_server] tower dashboard analysis callback failed for request %s", request_id)
+
+    async def _handle_tower_dashboard_analysis_body(
+        self,
+        body: Dict[str, Any],
+        *,
+        request_id: str,
+    ) -> "web.Response":
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        prompt_text = str(body.get("prompt_text") or "").strip()
+        report_input = body.get("report_input")
+        if not prompt_text:
+            return web.json_response(_tower_error("prompt_text is required", "missing_prompt_text"), status=400)
+        if not isinstance(report_input, dict):
+            return web.json_response(_tower_error("report_input must be an object", "invalid_report_input"), status=400)
+
+        prompt_version = str(body.get("prompt_version") or "v1").strip() or "v1"
+        callback_url = str(body.get("callback_url") or "").strip()
+        if callback_url:
+            missing = [field for field in ("tenant_id",) if not str(body.get(field) or "").strip()]
+            if missing:
+                return web.json_response(
+                    _tower_error(f"Missing required fields: {', '.join(missing)}", "missing_fields"),
+                    status=400,
+                )
+            if not self._tower_internal_token():
+                return web.json_response(
+                    _tower_error("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured", "missing_internal_token"),
+                    status=500,
+                )
+            job = asyncio.create_task(self._run_tower_dashboard_analysis_job(body, request_id))
+            try:
+                self._background_tasks.add(job)
+            except TypeError:
+                pass
+            if hasattr(job, "add_done_callback"):
+                job.add_done_callback(self._background_tasks.discard)
+            return web.json_response(
+                {
+                    "request_id": request_id,
+                    "task_id": str(body.get("task_id") or "").strip(),
+                    "status": "accepted",
+                    "prompt_version": prompt_version,
+                },
+                status=202,
+            )
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = self._resolve_tower_review_runtime_model(
+            body,
+            runtime_provider=str(runtime_kwargs.get("provider") or "").strip() or None,
+        )
+        try:
+            report = await self._run_tower_dashboard_analysis(
+                request_id=request_id,
+                task_id=str(body.get("task_id") or request_id),
+                runtime_model=runtime_model,
+                prompt_version=prompt_version,
+                prompt_text=prompt_text,
+                report_input=report_input,
+                scope=body.get("scope") if isinstance(body.get("scope"), dict) else {},
+                data_watermark=body.get("data_watermark"),
+            )
+        except ValueError as exc:
+            return web.json_response(_tower_error(str(exc), "invalid_dashboard_analysis_output"), status=502)
+        except Exception as exc:
+            logger.exception("[api_server] tower dashboard analysis request %s failed", request_id)
+            return web.json_response(_tower_error(str(exc), "dashboard_analysis_failed"), status=500)
+
+        return web.json_response(
+            {
+                "request_id": request_id,
+                "task_id": str(body.get("task_id") or "").strip(),
+                "status": "completed",
+                "prompt_version": prompt_version,
+                "report": report,
+            },
+            status=200,
+        )
+
+    async def _handle_tower_dashboard_analysis(self, request: "web.Request") -> "web.Response":
+        """POST /api/tower/sales-target/dashboard-analysis."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
+        request_id = f"tower_dashboard_{uuid.uuid4().hex}"
+        return await self._handle_tower_dashboard_analysis_body(body, request_id=request_id)
+
+    async def _run_tower_inventory_health_dashboard_report(
+        self,
+        *,
+        request_id: str,
+        runtime_model: str,
+        prompt_version: str,
+        prompt_text: str,
+        report_input: Dict[str, Any],
+        scope: Dict[str, Any],
+        snapshot_week: str,
+    ) -> Dict[str, Any]:
+        """Run a Tower-provided inventory health dashboard report prompt."""
+        dashboard_prompt = str(prompt_text or "").strip()
+        if not dashboard_prompt:
+            raise ValueError("prompt_text is required")
+        if not isinstance(report_input, dict):
+            raise ValueError("report_input must be an object")
+
+        loop = asyncio.get_event_loop()
+        system_prompt = (
+            "You are Hermes executing a Tower-provided inventory health dashboard analysis instruction.\n"
+            "Return STRICT JSON only. No markdown, no prose, no code fences.\n"
+            "Use the Tower prompt below as the only content guidance.\n"
+            "Use only the supplied report_input fields. Do not recalculate or alter supplied metrics.\n\n"
+            "Tower prompt:\n"
+            f"{dashboard_prompt}\n\n"
+            "Output schema:\n"
+            "{\n"
+            '  "summary": "short business summary",\n'
+            '  "risk_findings": ["risk finding"],\n'
+            '  "recommended_actions": ["recommended action"],\n'
+            '  "follow_up_questions": ["optional follow-up question"]\n'
+            "}\n"
+            "Protocol rules:\n"
+            "- summary must be non-empty.\n"
+            "- risk_findings and recommended_actions must be arrays.\n"
+            "- Keep recommendations actionable and grounded in the supplied dashboard data.\n"
+        )
+        user_message = (
+            f"Request ID: {request_id}\n"
+            f"Prompt version: {prompt_version}\n"
+            f"Snapshot week: {snapshot_week}\n"
+            f"Scope: {json.dumps(scope, ensure_ascii=False)}\n\n"
+            "report_input:\n"
+            f"{json.dumps(report_input, ensure_ascii=False, indent=2)}"
+        )
+
+        def _run() -> str:
+            from run_agent import AIAgent
+            from gateway.run import _resolve_runtime_agent_kwargs, GatewayRunner
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            fallback_model = GatewayRunner._load_fallback_model()
+            agent = AIAgent(
+                model=runtime_model,
+                **runtime_kwargs,
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                ephemeral_system_prompt=system_prompt,
+                enabled_toolsets=[],
+                session_id=f"tower_inventory_health_{request_id}",
+                platform="api_server",
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=None,
+                persist_session=False,
+                fallback_model=fallback_model,
+            )
+            result = agent.run_conversation(user_message=user_message, conversation_history=[])
+            return result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+        raw_response = await loop.run_in_executor(None, _run)
+        parsed = _extract_json_from_text(raw_response)
+        if not isinstance(parsed, dict):
+            raise ValueError("Hermes inventory health report output was not valid JSON")
+        return self._normalize_tower_inventory_health_dashboard_report(parsed)
+
+    @staticmethod
+    def _normalize_tower_inventory_health_dashboard_report(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        def _decode_value(value: Any) -> Any:
+            if isinstance(value, str):
+                candidate = value.strip()
+                if candidate.startswith(("{", "[")):
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        return value
+            return value
+
+        def _text_from_value(value: Any) -> str:
+            decoded = _decode_value(value)
+            if isinstance(decoded, str):
+                return decoded.strip()
+            if isinstance(decoded, dict):
+                for key in ("summary", "text", "content", "description", "conclusion"):
+                    nested = decoded.get(key)
+                    if isinstance(nested, str) and nested.strip():
+                        return nested.strip()
+            return ""
+
+        def _first_text(*keys: str) -> str:
+            for key in keys:
+                text_value = _text_from_value(parsed.get(key))
+                if text_value:
+                    return text_value
+            return ""
+
+        def _list_from_value(value: Any, nested_keys: tuple[str, ...]) -> List[Any]:
+            decoded = _decode_value(value)
+            if isinstance(decoded, list):
+                return decoded
+            if isinstance(decoded, dict):
+                for nested_key in ("items", *nested_keys):
+                    nested = decoded.get(nested_key)
+                    if isinstance(nested, list):
+                        return nested
+                    if isinstance(nested, str) and nested.strip():
+                        return [nested.strip()]
+            if isinstance(decoded, str) and decoded.strip():
+                return [decoded.strip()]
+            return []
+
+        def _list_field(*keys: str) -> List[Any]:
+            nested_keys = tuple(keys)
+            for key in keys:
+                values = _list_from_value(parsed.get(key), nested_keys)
+                if values:
+                    return values
+            return []
+
+        risk_findings = _list_field("risk_findings", "riskFindings", "key_risks", "keyRisks", "risks", "findings")
+        recommended_actions = _list_field("recommended_actions", "recommendedActions", "recommendations", "actions", "suggestions")
+        follow_up_questions = _list_field("follow_up_questions", "followUpQuestions", "questions", "next_questions", "nextQuestions")
+        summary = _first_text(
+            "summary",
+            "executive_summary",
+            "executiveSummary",
+            "analysis_summary",
+            "analysisSummary",
+            "overall_summary",
+            "overallSummary",
+            "score_summary",
+            "scoreSummary",
+            "conclusion",
+        )
+        if not summary and risk_findings:
+            summary = f"本次分析识别出 {len(risk_findings)} 项主要库存健康风险，首要风险：{str(risk_findings[0])[:240]}"
+        if not summary and recommended_actions:
+            summary = f"本次分析形成 {len(recommended_actions)} 项库存健康治理动作，首要动作：{str(recommended_actions[0])[:240]}"
+        if not summary:
+            for value in parsed.values():
+                summary = _text_from_value(value)
+                if summary:
+                    break
+        if not summary:
+            summary = json.dumps(parsed, ensure_ascii=False)[:800]
+
+        return {
+            "summary": summary,
+            "risk_findings": risk_findings,
+            "recommended_actions": recommended_actions,
+            "follow_up_questions": follow_up_questions,
+        }
+
+    async def _post_tower_inventory_health_dashboard_result(
+        self,
+        *,
+        callback_url: str,
+        tenant_id: str,
+        request_id: str,
+        model_name: str,
+        prompt_version: str,
+        status: str,
+        report: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Callback Tower with inventory health dashboard report result."""
+        if not self._tower_internal_token():
+            raise RuntimeError("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured")
+
+        import aiohttp
+
+        body: Dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "hermes_request_id": request_id,
+            "model_name": model_name,
+            "prompt_version": prompt_version,
+            "status": status,
+        }
+        if report is not None:
+            body["report"] = report
+        if error_message:
+            body["error_message"] = str(error_message)[:1000]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=body,
+                headers=self._tower_internal_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"Tower inventory health callback failed ({response.status}): {text[:400]}")
+
+    async def _run_tower_inventory_health_dashboard_job(self, payload: Dict[str, Any], request_id: str) -> None:
+        """Background job: run inventory health dashboard analysis and callback Tower."""
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        callback_url = str(payload.get("callback_url") or "").strip()
+        prompt_version = str(payload.get("prompt_version") or "v1").strip() or "v1"
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = self._resolve_tower_review_runtime_model(
+            payload,
+            runtime_provider=str(runtime_kwargs.get("provider") or "").strip() or None,
+        )
+        try:
+            report = await self._run_tower_inventory_health_dashboard_report(
+                request_id=request_id,
+                runtime_model=runtime_model,
+                prompt_version=prompt_version,
+                prompt_text=str(payload.get("prompt_text") or ""),
+                report_input=payload.get("report_input") if isinstance(payload.get("report_input"), dict) else {},
+                scope=payload.get("scope") if isinstance(payload.get("scope"), dict) else {},
+                snapshot_week=str(payload.get("snapshot_week") or ""),
+            )
+            await self._post_tower_inventory_health_dashboard_result(
+                callback_url=callback_url,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                model_name=runtime_model,
+                prompt_version=prompt_version,
+                status="completed",
+                report=report,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] tower inventory health dashboard request %s failed", request_id)
+            if not callback_url:
+                return
+            try:
+                await self._post_tower_inventory_health_dashboard_result(
+                    callback_url=callback_url,
+                    tenant_id=tenant_id,
+                    request_id=request_id,
+                    model_name=runtime_model,
+                    prompt_version=prompt_version,
+                    status="failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("[api_server] tower inventory health callback failed for request %s", request_id)
+
+    async def _handle_tower_inventory_health_dashboard_analysis(self, request: "web.Request") -> "web.Response":
+        """POST /api/tower/inventory-health/dashboard-analysis."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
+
+        required_text_fields = [
+            "task_id",
+            "tenant_id",
+            "view_id",
+            "snapshot_week",
+            "prompt_text",
+            "callback_url",
+        ]
+        missing = [field for field in required_text_fields if not str(body.get(field) or "").strip()]
+        if "report_input" not in body:
+            missing.append("report_input")
+        if missing:
+            return web.json_response(
+                _tower_error(f"Missing required fields: {', '.join(missing)}", "missing_fields"),
+                status=400,
+            )
+        if not isinstance(body.get("report_input"), dict):
+            return web.json_response(_tower_error("report_input must be an object", "invalid_report_input"), status=400)
+        if not self._tower_internal_token():
+            return web.json_response(
+                _tower_error("AGENT_WORKSPACE_INTERNAL_TOKEN is not configured", "missing_internal_token"),
+                status=500,
+            )
+
+        request_id = f"tower_inventory_health_{uuid.uuid4().hex}"
+        job = asyncio.create_task(self._run_tower_inventory_health_dashboard_job(body, request_id))
+        try:
+            self._background_tasks.add(job)
+        except TypeError:
+            pass
+        if hasattr(job, "add_done_callback"):
+            job.add_done_callback(self._background_tasks.discard)
+
+        return web.json_response(
+            {
+                "request_id": request_id,
+                "task_id": str(body.get("task_id") or "").strip(),
+                "status": "accepted",
+            },
+            status=202,
+        )
+
     async def _fetch_tower_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch batch review context from Tower using the shared internal token."""
         if not self._tower_internal_token():
@@ -2190,9 +2847,13 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_tower_error("Invalid JSON", "invalid_json"), status=400)
-        if str(body.get("mode") or "").strip() == "summary_guidance":
+        mode = str(body.get("mode") or "").strip()
+        if mode == "summary_guidance":
             request_id = f"tower_summary_{uuid.uuid4().hex}"
             return await self._handle_tower_progress_summary_guidance_body(body, request_id=request_id)
+        if mode == "sales_target_dashboard_analysis":
+            request_id = f"tower_dashboard_{uuid.uuid4().hex}"
+            return await self._handle_tower_dashboard_analysis_body(body, request_id=request_id)
 
         required_fields = [
             "task_id",
@@ -2309,7 +2970,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
+        user_message = raw_input if isinstance(raw_input, str) else (
+            _normalize_chat_content(raw_input[-1].get("content", "")) if isinstance(raw_input, list) else ""
+        )
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
@@ -2354,7 +3017,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                conversation_history.append({
+                    "role": str(entry["role"]),
+                    "content": _normalize_chat_content(entry["content"]),
+                })
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -2371,14 +3037,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+                    content = _normalize_chat_content(msg["content"])
+                    conversation_history.append({"role": msg["role"], "content": content})
 
         session_id = body.get("session_id") or run_id
         ephemeral_system_prompt = instructions
@@ -2388,6 +3048,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
+                    model_name=body.get("model", self._model_name),
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
@@ -2514,6 +3175,25 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
 
+        if is_network_accessible(self._host):
+            try:
+                from hermes_cli.auth import has_usable_secret
+            except ImportError:
+                has_usable_secret = None  # type: ignore[assignment]
+
+            key_is_usable = (
+                bool(self._api_key)
+                if has_usable_secret is None
+                else has_usable_secret(self._api_key, min_length=4)
+            )
+            if not key_is_usable:
+                logger.error(
+                    "[%s] Refusing to bind API server to %s without a usable API key",
+                    self.name,
+                    self._host,
+                )
+                return False
+
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
@@ -2538,6 +3218,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/api/tower/sales-target/agent-review", self._handle_tower_sales_target_review)
+            self._app.router.add_post("/api/tower/sales-target/dashboard-analysis", self._handle_tower_dashboard_analysis)
+            self._app.router.add_post(
+                "/api/tower/inventory-health/dashboard-analysis",
+                self._handle_tower_inventory_health_dashboard_analysis,
+            )
             self._app.router.add_post(
                 "/api/tower/sales-target/progress-reminder/summary-guidance",
                 self._handle_tower_progress_summary_guidance,
